@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "adjoint-core"
+version = "0.1.0"
+description = "Reverse-mode Adjoint Algorithmic Differentiation engine for derivative pricing"
+requires-python = ">=3.9"
+
+[tool.maturin]
+# Matches Cargo.toml's [lib] name = "adjoint_core": the compiled extension is
+# imported as `import adjoint_core`.
+module-name = "adjoint_core"
+# Cargo.toml's own "extension-module" feature (which enables pyo3's), kept
+# off by default so `cargo test` never tries to link a Python extension.
+features = ["extension-module"]

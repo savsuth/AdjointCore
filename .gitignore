@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+*.so
+*.pyd
+__pycache__/
+.venv/
+
+# Agent instruction files are never tracked or shipped.
+claude.md
+CLAUDE.md
+AGENTS.md
+.claude/
+.impeccable/
