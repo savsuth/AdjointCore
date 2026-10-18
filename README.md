@@ -30,10 +30,23 @@ functions are all implemented in this repository.
   heap allocations.
 
 - **Dual number (`src/dual.rs`)**: A 16-byte `Copy` handle formatted as
-  `{ value: f64, index: u32 }`, which holds no derivative data of its
-  own — every partial resides on the tape. The `Gradient` struct reads
-  directly from the tape's adjoint buffer rather than returning a copy,
-  ensuring `.backward()` performs no allocations.
+  `{ value: f64, index: u32, generation: u32 }`, which holds no derivative
+  data of its own — every partial resides on the tape. The `Gradient`
+  struct reads directly from the tape's adjoint buffer rather than
+  returning a copy, ensuring `.backward()` performs no allocations.
+
+- **Handle validity**: A `Dual` is valid only on the tape recording it came
+  from (same thread, no `tape::reset()` since), and a `Gradient` only until
+  the next `backward()` or reset on that thread. Each recording gets a
+  process-wide unique generation id, and any use outside that window
+  panics with a "stale" message instead of silently reading whatever node
+  now occupies the same index. Previously this window was documented for
+  `Gradient` but not enforced; the pricer and the existing tests already
+  stayed inside it, so their results are unchanged. The cost is one relaxed atomic add per reset and an
+  integer compare per recorded operation, sweep, and `wrt` call. The
+  generation counter is a `u32` so `Dual` stays 16 bytes; it wraps after
+  2^32 resets, so a handle reused exactly that many generations later
+  would not be caught.
 
 - **Operators (`src/ops.rs`)**: `Add`, `Sub`, `Mul`, and `Div` are
   implemented across all three relevant operand shapes (`Dual op Dual`,
@@ -85,12 +98,13 @@ python main.py
 cargo test
 ```
 
-The suite comprises 32 tests across four modules: the tape's accumulation
+The suite comprises 40 tests across five modules: the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
-against its analytical derivative, and the Monte Carlo engine verified
+against its analytical derivative, the Monte Carlo engine verified
 against closed-form Black-Scholes with an additional cross-seed consistency
-check.
+check, and handle validity (stale `Dual` and `Gradient` use after a reset,
+a second sweep, or on another thread is rejected).
 
 ## Benchmarking
 
