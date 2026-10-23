@@ -1,5 +1,6 @@
 //! Reverse-mode Adjoint Algorithmic Differentiation for derivative pricing.
 
+pub mod bump;
 pub mod dual;
 pub mod ops;
 pub mod payoff;
@@ -13,6 +14,7 @@ pub mod tape;
 // how it's nested or what its visibility is.
 mod python;
 
+pub use bump::bump_and_reval;
 pub use dual::{Dual, Gradient};
 pub use payoff::{AsianCall, EuropeanCall, EuropeanPut, Payoff, Real};
 pub use pricer::{

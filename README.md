@@ -145,7 +145,7 @@ python main.py
 cargo test
 ```
 
-The suite comprises 55 tests across seven modules: the tape's accumulation
+The suite comprises 58 tests across eight modules: the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
@@ -164,10 +164,76 @@ common random numbers. The volatility curve is checked as follows:
 - An Asian whose fixings fall between bucket edges agrees with the flat
   Asian.
 
+`bump_and_reval` is checked against the adjoint Greeks on the same seed,
+for a European and an Asian call on vol curves, and its price must equal the
+adjoint price exactly.
+
 All Monte Carlo checks use a tolerance of five standard errors of the
 estimator under test.
 
 ## Benchmarking
+
+### AAD against bump-and-reval as the sensitivity count grows
+
+```bash
+cargo run --release --example scaling
+```
+
+`examples/scaling.rs` prices an arithmetic Asian call (100 fixings, T = 1,
+S = K = 100, r = 5%, flat 20% vol split into N buckets) on 10,000 paths with
+seed 42. It returns N + 2 sensitivities (Delta, Rho, N bucket vegas) two
+ways:
+
+- the adjoint pricer, with one backward sweep per path;
+- `bump_and_reval` (`src/bump.rs`), with central differences of the
+  tape-free pricer. Every revaluation is re-seeded so all of them see the
+  same paths, which gives 2N + 5 valuations in all.
+
+Both methods use the same paths, seed, and 100-step grid. Every N divides
+100, so one valuation costs the same at every N. Each N gets one discarded
+warm-up round, then seven timed rounds, each running the three methods back
+to back. The table shows the median and [min, max] wall time.
+
+Measured on 2026-10-23: Apple M4, 10 cores, 16 GB, macOS (Darwin 24.1.0),
+rustc 1.97.1, single-threaded, release profile.
+
+| N | sensitivities | valuation ms | AAD ms | bump ms | AAD / bump | AAD / valuation | bump / valuation | tape nodes / path | max gap (SE) |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 3 | 13.8 | 39.2 [39.1, 39.3] | 97.4 [96.9, 102.0] | 0.403 | 2.83 | 7.0 | 512 | 0.027 |
+| 2 | 4 | 13.9 | 39.7 [39.6, 42.1] | 128.2 [125.5, 144.1] | 0.310 | 2.85 | 9.2 | 518 | 0.027 |
+| 5 | 7 | 14.1 | 40.9 [40.8, 41.3] | 212.4 [211.0, 213.5] | 0.193 | 2.91 | 15.1 | 536 | 0.027 |
+| 10 | 12 | 14.5 | 43.0 [42.8, 45.3] | 361.4 [358.4, 372.7] | 0.119 | 2.97 | 25.0 | 566 | 0.027 |
+| 25 | 27 | 14.3 | 48.1 [47.9, 49.5] | 801.4 [793.2, 880.1] | 0.060 | 3.36 | 55.9 | 656 | 0.027 |
+| 50 | 52 | 15.0 | 56.0 [55.9, 57.4] | 1563.2 [1556.2, 1583.6] | 0.036 | 3.75 | 104.5 | 806 | 0.027 |
+| 100 | 102 | 15.2 | 73.6 [73.6, 75.9] | 3151.1 [3142.9, 3193.1] | 0.023 | 4.84 | 207.1 | 1106 | 0.027 |
+
+What the numbers say:
+
+- **Bump-and-reval scales with N, as theory predicts.** Its cost is
+  2N + 5 valuations. The measured ratio to one valuation is 7.0 at N = 1 and
+  207.1 at N = 100, against 7 and 205.
+- **AAD does not scale with N, but it is not perfectly flat either.** Going
+  from 3 to 102 sensitivities raised its cost from 2.83 to 4.84 valuations
+  (39.2 to 73.6 ms). The reason is the tape. Each bucket adds one input node
+  plus five nodes for its drift and diffusion terms, so the tape grows from
+  512 to 1106 nodes per path, exactly 6 per extra bucket. Each extra vega
+  also costs one adjoint lookup and one accumulator update per path. Time
+  grows smoothly with tape length, with no step that would point to a cache
+  effect. At 1106 nodes the tape and its adjoints are about 35 KB per path
+  (24-byte nodes plus 8-byte adjoints), a figure derived from the struct
+  sizes rather than measured.
+- **At N = 100, AAD returns 102 sensitivities 43x faster than
+  bump-and-reval** (73.6 ms against 3151.1 ms).
+- **Both methods compute the same Greeks.** The largest gap between any
+  adjoint Greek and its bump-and-reval value is 0.027 of the adjoint
+  estimator's standard error at every N.
+- **Run-to-run variation.** A second run of the same command gave an AAD
+  median of 73.5 ms and a bump median of 3214.1 ms at N = 100. An earlier
+  run, made before the tape column was added and with other load on the
+  machine, gave a bump median of 3625.1 ms with a max of 5555.7 ms. The AAD
+  column was stable within about 1 ms across all three runs.
+
+### Python call latency
 
 ```bash
 python benchmark.py
