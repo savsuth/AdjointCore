@@ -96,52 +96,223 @@ impl RunningStats {
     }
 }
 
+/// Price and sensitivities of an option under a piecewise-constant vol
+/// curve: one vega per bucket, in bucket order.
+#[derive(Clone, Debug)]
+pub struct BucketedGreeks {
+    pub price: f64,
+    pub delta: f64,
+    pub rho: f64,
+    pub vegas: Vec<f64>,
+}
+
+/// A Monte Carlo estimate on a vol curve, with each quantity's own standard
+/// error attached, as in [`MonteCarloResult`].
+#[derive(Clone, Debug)]
+pub struct BucketedResult {
+    pub greeks: BucketedGreeks,
+    pub std_error: BucketedGreeks,
+}
+
+/// One step of the simulation grid. Every step lies inside a single vol
+/// bucket, so the exact log-normal transition applies with that bucket's vol.
+struct Step {
+    bucket: usize,
+    dt: f64,
+    sqrt_dt: f64,
+    /// Whether the step ends on one of the payoff's fixing dates.
+    fixing: bool,
+}
+
+/// The simulation grid out to maturity, which is also the discounting date.
+struct TimeGrid {
+    steps: Vec<Step>,
+    maturity: f64,
+}
+
+/// The payoff's fixing dates merged with the vol buckets' edges.
+///
+/// Fixings sit at i T / n and bucket edges at j T / N, so in units of
+/// T / (n N) both are integers (i N and j n) and merge exactly, with no
+/// floating-point comparison of times. With one bucket this is the uniform
+/// fixing grid, and dt = T / n computed exactly as the flat pricer did.
+fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
+    assert!(fixings > 0, "a payoff needs at least one fixing date");
+    assert!(buckets > 0, "a vol curve needs at least one bucket");
+    let units = fixings * buckets;
+
+    let mut grid = Vec::with_capacity(fixings + buckets);
+    let (mut i, mut j, mut prev) = (1, 1, 0);
+    while i <= fixings {
+        let fixing_at = i * buckets;
+        let edge_at = j * fixings;
+        let next = fixing_at.min(edge_at);
+        let dt = time * (next - prev) as f64 / units as f64;
+        grid.push(Step {
+            bucket: prev / fixings,
+            dt,
+            sqrt_dt: dt.sqrt(),
+            fixing: next == fixing_at,
+        });
+        if next == fixing_at {
+            i += 1;
+        }
+        if next == edge_at {
+            j += 1;
+        }
+        prev = next;
+    }
+    TimeGrid {
+        steps: grid,
+        maturity: time,
+    }
+}
+
 /// One path's discounted payoff, written once for both scalar types.
 ///
-/// The spot moves between equally spaced fixing dates by the exact
-/// log-normal step S * exp((r - vol^2 / 2) dt + vol sqrt(dt) z), which is
-/// Euler-Maruyama on ln S and has no discretization bias for GBM. Each step
-/// draws one normal from `rng` in date order, so two runs on the same seed
-/// see the same paths whatever scalar type they are in. `path` is a buffer
-/// reused across paths; after the first path it never reallocates.
+/// The spot moves along `grid` by the exact log-normal step
+/// S * exp((r - vol^2 / 2) dt + vol sqrt(dt) z), which is Euler-Maruyama on
+/// ln S and has no discretization bias for GBM with piecewise-constant vol.
+/// Each step draws one normal from `rng` in date order, so two runs on the
+/// same seed see the same paths whatever scalar type they are in. `path` is
+/// a buffer reused across paths; after the first path it never reallocates.
+///
+/// The drift and vol sqrt(dt) terms are recorded once per run of steps with
+/// the same bucket and dt, not once per step, which keeps the tape short.
 fn discounted_payoff<T: Real, P: Payoff, R: Rng>(
     payoff: &P,
+    grid: &TimeGrid,
     spot: T,
     rate: T,
-    vol: T,
-    time: f64,
+    vols: &[T],
     path: &mut Vec<T>,
     rng: &mut R,
 ) -> T {
-    let steps = payoff.fixings();
-    let dt = time / steps as f64;
-    let drift = (rate - vol * vol * 0.5) * dt;
-    let vol_sqrt_dt = vol * dt.sqrt();
-
     path.clear();
     let mut s = spot;
-    for _ in 0..steps {
+    let mut segment: Option<(usize, f64, T, T)> = None;
+    for step in &grid.steps {
+        let (drift, vol_sqrt_dt) = match segment {
+            Some((bucket, dt, drift, vol_sqrt_dt)) if bucket == step.bucket && dt == step.dt => {
+                (drift, vol_sqrt_dt)
+            }
+            _ => {
+                let vol = vols[step.bucket];
+                let drift = (rate - vol * vol * 0.5) * step.dt;
+                let vol_sqrt_dt = vol * step.sqrt_dt;
+                segment = Some((step.bucket, step.dt, drift, vol_sqrt_dt));
+                (drift, vol_sqrt_dt)
+            }
+        };
         let z: f64 = StandardNormal.sample(rng);
         s = s * (drift + vol_sqrt_dt * z).exp();
-        path.push(s);
+        if step.fixing {
+            path.push(s);
+        }
     }
 
-    (rate * -time).exp() * payoff.value(path)
+    (rate * -grid.maturity).exp() * payoff.value(path)
 }
 
-/// Monte Carlo price and Greeks of `payoff`, differentiated with one
-/// reverse-mode adjoint sweep per path. That's the pathwise approach,
-/// ∇E[V] = E[∇V], which is valid because every payoff offered here is
-/// continuous in the path.
+/// Monte Carlo price and Greeks of `payoff` under a piecewise-constant vol
+/// curve, differentiated with one reverse-mode adjoint sweep per path. That's
+/// the pathwise approach, ∇E[V] = E[∇V], which is valid because every payoff
+/// offered here is continuous in the path.
 ///
-/// Spot, Rate, and Vol are all tape variables, so Delta/Rho/Vega just fall
-/// out of the same sweep that gives us the price. Time and the payoff's own
-/// terms (strike, fixings) stay plain constants.
+/// `vols` holds one volatility per bucket, the buckets splitting [0, T] into
+/// `vols.len()` equal pieces. Spot, Rate, and every bucket vol are tape
+/// variables, so Delta, Rho, and all the bucket vegas fall out of the same
+/// sweep that gives us the price: one sweep per path however many buckets
+/// there are. Time and the payoff's own terms (strike, fixings) stay plain
+/// constants.
 ///
 /// The tape gets reset after every single path (see [`tape::reset`]), and
 /// because its high-water-mark capacity carries over between resets, every
 /// path after the first one doesn't allocate anything at all during the
 /// forward pass.
+pub fn monte_carlo_greeks_bucketed<P: Payoff, R: Rng>(
+    payoff: &P,
+    spot: f64,
+    rate: f64,
+    vols: &[f64],
+    time: f64,
+    num_paths: u64,
+    rng: &mut R,
+) -> BucketedResult {
+    let grid = time_grid(payoff.fixings(), vols.len(), time);
+
+    let mut price_stats = RunningStats::default();
+    let mut delta_stats = RunningStats::default();
+    let mut rho_stats = RunningStats::default();
+    let mut vega_stats: Vec<RunningStats> = vols.iter().map(|_| RunningStats::default()).collect();
+    let mut vol_vars = Vec::with_capacity(vols.len());
+    let mut path = Vec::with_capacity(payoff.fixings());
+
+    for _ in 0..num_paths {
+        let s = Dual::var(spot);
+        let r = Dual::var(rate);
+        vol_vars.clear();
+        vol_vars.extend(vols.iter().map(|&v| Dual::var(v)));
+
+        let discounted = discounted_payoff(payoff, &grid, s, r, &vol_vars, &mut path, rng);
+        let grad = discounted.backward();
+
+        price_stats.update(discounted.value);
+        delta_stats.update(grad.wrt(s));
+        rho_stats.update(grad.wrt(r));
+        for (stats, &vol) in vega_stats.iter_mut().zip(&vol_vars) {
+            stats.update(grad.wrt(vol));
+        }
+
+        tape::reset();
+    }
+
+    BucketedResult {
+        greeks: BucketedGreeks {
+            price: price_stats.mean,
+            delta: delta_stats.mean,
+            rho: rho_stats.mean,
+            vegas: vega_stats.iter().map(|v| v.mean).collect(),
+        },
+        std_error: BucketedGreeks {
+            price: price_stats.standard_error(),
+            delta: delta_stats.standard_error(),
+            rho: rho_stats.standard_error(),
+            vegas: vega_stats.iter().map(|v| v.standard_error()).collect(),
+        },
+    }
+}
+
+/// Monte Carlo price of `payoff` under a piecewise-constant vol curve with
+/// nothing recorded on the tape.
+///
+/// Same paths as [`monte_carlo_greeks_bucketed`] for the same seed, and the
+/// same accumulator, so its price matches that one exactly. This is the
+/// revaluation that bump-and-reval repeats once per bumped input.
+pub fn monte_carlo_value_bucketed<P: Payoff, R: Rng>(
+    payoff: &P,
+    spot: f64,
+    rate: f64,
+    vols: &[f64],
+    time: f64,
+    num_paths: u64,
+    rng: &mut R,
+) -> f64 {
+    let grid = time_grid(payoff.fixings(), vols.len(), time);
+    let mut price_stats = RunningStats::default();
+    let mut path = Vec::with_capacity(payoff.fixings());
+
+    for _ in 0..num_paths {
+        price_stats.update(discounted_payoff(
+            payoff, &grid, spot, rate, vols, &mut path, rng,
+        ));
+    }
+
+    price_stats.mean
+}
+
+/// Monte Carlo price and Greeks of `payoff` under a flat vol: the one-bucket
+/// curve of [`monte_carlo_greeks_bucketed`].
 pub fn monte_carlo_greeks<P: Payoff, R: Rng>(
     payoff: &P,
     spot: f64,
@@ -151,49 +322,21 @@ pub fn monte_carlo_greeks<P: Payoff, R: Rng>(
     num_paths: u64,
     rng: &mut R,
 ) -> MonteCarloResult {
-    let mut price_stats = RunningStats::default();
-    let mut delta_stats = RunningStats::default();
-    let mut vega_stats = RunningStats::default();
-    let mut rho_stats = RunningStats::default();
-    let mut path = Vec::with_capacity(payoff.fixings());
-
-    for _ in 0..num_paths {
-        let s = Dual::var(spot);
-        let r = Dual::var(rate);
-        let vol_d = Dual::var(vol);
-
-        let discounted = discounted_payoff(payoff, s, r, vol_d, time, &mut path, rng);
-        let grad = discounted.backward();
-
-        price_stats.update(discounted.value);
-        delta_stats.update(grad.wrt(s));
-        vega_stats.update(grad.wrt(vol_d));
-        rho_stats.update(grad.wrt(r));
-
-        tape::reset();
-    }
-
+    let curve = monte_carlo_greeks_bucketed(payoff, spot, rate, &[vol], time, num_paths, rng);
+    let flat = |g: &BucketedGreeks| Greeks {
+        price: g.price,
+        delta: g.delta,
+        vega: g.vegas[0],
+        rho: g.rho,
+    };
     MonteCarloResult {
-        greeks: Greeks {
-            price: price_stats.mean,
-            delta: delta_stats.mean,
-            vega: vega_stats.mean,
-            rho: rho_stats.mean,
-        },
-        std_error: Greeks {
-            price: price_stats.standard_error(),
-            delta: delta_stats.standard_error(),
-            vega: vega_stats.standard_error(),
-            rho: rho_stats.standard_error(),
-        },
+        greeks: flat(&curve.greeks),
+        std_error: flat(&curve.std_error),
     }
 }
 
-/// Monte Carlo price of `payoff` with nothing recorded on the tape.
-///
-/// Same paths as [`monte_carlo_greeks`] for the same seed, and the same
-/// accumulator, so its price matches that one exactly. This is the
-/// revaluation that bump-and-reval repeats once per bumped input.
+/// Monte Carlo price of `payoff` under a flat vol with nothing recorded on
+/// the tape; see [`monte_carlo_value_bucketed`].
 pub fn monte_carlo_value<P: Payoff, R: Rng>(
     payoff: &P,
     spot: f64,
@@ -203,16 +346,7 @@ pub fn monte_carlo_value<P: Payoff, R: Rng>(
     num_paths: u64,
     rng: &mut R,
 ) -> f64 {
-    let mut price_stats = RunningStats::default();
-    let mut path = Vec::with_capacity(payoff.fixings());
-
-    for _ in 0..num_paths {
-        price_stats.update(discounted_payoff(
-            payoff, spot, rate, vol, time, &mut path, rng,
-        ));
-    }
-
-    price_stats.mean
+    monte_carlo_value_bucketed(payoff, spot, rate, &[vol], time, num_paths, rng)
 }
 
 /// Monte Carlo price and Greeks for a European Call; see

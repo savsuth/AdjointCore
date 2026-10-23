@@ -5,7 +5,7 @@ engine, implemented from first principles in Rust. It prices European calls,
 European puts, and arithmetic-average Asian calls by Monte Carlo simulation
 and, within the same computation, recovers their Greeks (Delta, Vega, and
 Rho) from a single backward sweep per simulated path. The engine is exposed
-to Python through PyO3 and `maturin` (currently the European call only),
+to Python through PyO3 and `maturin` (currently the European call),
 allowing it to be imported and called like any standard Python package once
 built.
 
@@ -93,9 +93,23 @@ functions are all implemented in this repository.
   quantity — a statistically grounded tolerance, rather than one fixed
   bound applied uniformly to all four estimators of differing variance.
 
-- **PyO3 bridge (`src/python.rs`)**: A single function, `mc_pricer`,
-  returns `{"price", "delta", "vega", "rho"}` as a Python dictionary. Once
-  built, the engine is accessible via `import adjoint_core`.
+- **Volatility curve (`src/pricer.rs`)**: `monte_carlo_greeks_bucketed`
+  takes a piecewise-constant volatility curve, with N equal buckets over
+  [0, T]. Every bucket volatility is its own tape variable, so one backward
+  sweep per path returns the price, Delta, Rho, and all N bucket vegas. The
+  simulation grid merges the payoff's fixing dates with the bucket edges
+  using exact integer arithmetic (both are integer multiples of T / (nN)),
+  so every step lies inside one bucket and stays an exact log-normal
+  transition. With one bucket the grid and arithmetic are those of the flat
+  pricer, and the results are bit-identical. The flat `monte_carlo_greeks`
+  is now that one-bucket case.
+
+- **PyO3 bridge (`src/python.rs`)**: `mc_pricer` returns
+  `{"price", "delta", "vega", "rho"}` for a European Call under a flat
+  volatility. `mc_pricer_buckets` takes a list of bucket volatilities and
+  returns `{"price", "delta", "rho", "vegas"}`, with `vegas` holding one
+  sensitivity per bucket. Once built, the engine is accessible via
+  `import adjoint_core`.
 
 ## Where the pathwise estimator stops working
 
@@ -131,7 +145,7 @@ python main.py
 cargo test
 ```
 
-The suite comprises 49 tests across six modules: the tape's accumulation
+The suite comprises 55 tests across seven modules: the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
@@ -140,8 +154,18 @@ check, handle validity (stale `Dual` and `Gradient` use after a reset,
 a second sweep, or on another thread is rejected), and the payoffs:
 the put against closed-form Black-Scholes and put-call parity on common
 paths, and each Asian Greek against central-difference bump-and-reval with
-common random numbers. All Monte Carlo checks use a tolerance of five
-standard errors of the estimator under test.
+common random numbers. The volatility curve is checked as follows:
+- One bucket reproduces the flat pricer bit for bit.
+- With equal bucket volatilities, the bucket vegas sum to the flat Vega
+  exactly on common paths, and to the Black-Scholes Vega statistically.
+- On an unequal curve, the price, Delta, Rho, and each bucket vega match
+  Black-Scholes at the integrated-variance volatility.
+- Each bucket vega matches bump-and-reval on common random numbers.
+- An Asian whose fixings fall between bucket edges agrees with the flat
+  Asian.
+
+All Monte Carlo checks use a tolerance of five standard errors of the
+estimator under test.
 
 ## Benchmarking
 
