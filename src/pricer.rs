@@ -1,5 +1,5 @@
-//! European Call pricing — an analytical Black-Scholes baseline to check
-//! against, and a Monte Carlo Euler-Maruyama simulator that gets to the same
+//! Option pricing — analytical Black-Scholes baselines to check against, and
+//! a Monte Carlo simulator, generic over the payoff, that gets to the same
 //! Greeks a completely different way: pathwise adjoint differentiation
 //! instead of a closed-form formula.
 
@@ -7,10 +7,11 @@ use rand::Rng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::dual::Dual;
+use crate::payoff::{EuropeanCall, Payoff, Real};
 use crate::special::{norm_cdf, norm_pdf};
 use crate::tape;
 
-/// Price and sensitivities of a European Call.
+/// Price and sensitivities of an option.
 #[derive(Clone, Copy, Debug)]
 pub struct Greeks {
     pub price: f64,
@@ -30,7 +31,7 @@ pub struct MonteCarloResult {
     pub std_error: Greeks,
 }
 
-/// Closed-form Black-Scholes price and Greeks — the ground truth we check
+/// Closed-form Black-Scholes price and Greeks of a European Call — the ground truth we check
 /// the Monte Carlo engine against. This isn't part of the AAD pipeline at
 /// all; everything here is just a plain `f64`.
 pub fn black_scholes(spot: f64, strike: f64, rate: f64, vol: f64, time: f64) -> Greeks {
@@ -45,6 +46,23 @@ pub fn black_scholes(spot: f64, strike: f64, rate: f64, vol: f64, time: f64) -> 
         delta: norm_cdf(d1),
         vega: spot * sqrt_t * norm_pdf(d1),
         rho: strike * time * discount * norm_cdf(d2),
+    }
+}
+
+/// Closed-form Black-Scholes price and Greeks of a European Put, the
+/// reference for the Monte Carlo put. Plain `f64`, like [`black_scholes`].
+pub fn black_scholes_put(spot: f64, strike: f64, rate: f64, vol: f64, time: f64) -> Greeks {
+    let sqrt_t = time.sqrt();
+    let d1 = ((spot / strike).ln() + (rate + 0.5 * vol * vol) * time) / (vol * sqrt_t);
+    let d2 = d1 - vol * sqrt_t;
+
+    let discount = (-rate * time).exp();
+
+    Greeks {
+        price: strike * discount * norm_cdf(-d2) - spot * norm_cdf(-d1),
+        delta: norm_cdf(d1) - 1.0,
+        vega: spot * sqrt_t * norm_pdf(d1),
+        rho: -strike * time * discount * norm_cdf(-d2),
     }
 }
 
@@ -78,52 +96,76 @@ impl RunningStats {
     }
 }
 
-/// Monte Carlo price and Greeks for a European Call, simulated with
-/// Euler-Maruyama and differentiated with one reverse-mode adjoint sweep per
-/// path — that's the pathwise approach, ∇E[V] = E[∇V].
+/// One path's discounted payoff, written once for both scalar types.
+///
+/// The spot moves between equally spaced fixing dates by the exact
+/// log-normal step S * exp((r - vol^2 / 2) dt + vol sqrt(dt) z), which is
+/// Euler-Maruyama on ln S and has no discretization bias for GBM. Each step
+/// draws one normal from `rng` in date order, so two runs on the same seed
+/// see the same paths whatever scalar type they are in. `path` is a buffer
+/// reused across paths; after the first path it never reallocates.
+fn discounted_payoff<T: Real, P: Payoff, R: Rng>(
+    payoff: &P,
+    spot: T,
+    rate: T,
+    vol: T,
+    time: f64,
+    path: &mut Vec<T>,
+    rng: &mut R,
+) -> T {
+    let steps = payoff.fixings();
+    let dt = time / steps as f64;
+    let drift = (rate - vol * vol * 0.5) * dt;
+    let vol_sqrt_dt = vol * dt.sqrt();
+
+    path.clear();
+    let mut s = spot;
+    for _ in 0..steps {
+        let z: f64 = StandardNormal.sample(rng);
+        s = s * (drift + vol_sqrt_dt * z).exp();
+        path.push(s);
+    }
+
+    (rate * -time).exp() * payoff.value(path)
+}
+
+/// Monte Carlo price and Greeks of `payoff`, differentiated with one
+/// reverse-mode adjoint sweep per path. That's the pathwise approach,
+/// ∇E[V] = E[∇V], which is valid because every payoff offered here is
+/// continuous in the path.
 ///
 /// Spot, Rate, and Vol are all tape variables, so Delta/Rho/Vega just fall
-/// out of the same sweep that gives us the price. Strike and Time stay plain
-/// constants, since we're not asking for a Greek against either of those.
+/// out of the same sweep that gives us the price. Time and the payoff's own
+/// terms (strike, fixings) stay plain constants.
 ///
 /// The tape gets reset after every single path (see [`tape::reset`]), and
 /// because its high-water-mark capacity carries over between resets, every
 /// path after the first one doesn't allocate anything at all during the
 /// forward pass.
-pub fn monte_carlo_price<R: Rng>(
+pub fn monte_carlo_greeks<P: Payoff, R: Rng>(
+    payoff: &P,
     spot: f64,
-    strike: f64,
     rate: f64,
     vol: f64,
     time: f64,
     num_paths: u64,
     rng: &mut R,
 ) -> MonteCarloResult {
-    let sqrt_t = time.sqrt();
-
     let mut price_stats = RunningStats::default();
     let mut delta_stats = RunningStats::default();
     let mut vega_stats = RunningStats::default();
     let mut rho_stats = RunningStats::default();
+    let mut path = Vec::with_capacity(payoff.fixings());
 
     for _ in 0..num_paths {
         let s = Dual::var(spot);
         let r = Dual::var(rate);
         let vol_d = Dual::var(vol);
 
-        let z: f64 = StandardNormal.sample(rng);
+        let discounted = discounted_payoff(payoff, s, r, vol_d, time, &mut path, rng);
+        let grad = discounted.backward();
 
-        let drift = (r - 0.5 * vol_d * vol_d) * time;
-        let diffusion = vol_d * sqrt_t * z;
-        let terminal_spot = s * (drift + diffusion).exp();
-
-        let discount = (0.0 - r * time).exp();
-        let payoff = (terminal_spot - strike).max_zero();
-        let discounted_payoff = discount * payoff;
-
-        let grad = discounted_payoff.backward();
-
-        price_stats.update(discounted_payoff.value);
+        price_stats.update(discounted.value);
         delta_stats.update(grad.wrt(s));
         vega_stats.update(grad.wrt(vol_d));
         rho_stats.update(grad.wrt(r));
@@ -145,4 +187,52 @@ pub fn monte_carlo_price<R: Rng>(
             rho: rho_stats.standard_error(),
         },
     }
+}
+
+/// Monte Carlo price of `payoff` with nothing recorded on the tape.
+///
+/// Same paths as [`monte_carlo_greeks`] for the same seed, and the same
+/// accumulator, so its price matches that one exactly. This is the
+/// revaluation that bump-and-reval repeats once per bumped input.
+pub fn monte_carlo_value<P: Payoff, R: Rng>(
+    payoff: &P,
+    spot: f64,
+    rate: f64,
+    vol: f64,
+    time: f64,
+    num_paths: u64,
+    rng: &mut R,
+) -> f64 {
+    let mut price_stats = RunningStats::default();
+    let mut path = Vec::with_capacity(payoff.fixings());
+
+    for _ in 0..num_paths {
+        price_stats.update(discounted_payoff(
+            payoff, spot, rate, vol, time, &mut path, rng,
+        ));
+    }
+
+    price_stats.mean
+}
+
+/// Monte Carlo price and Greeks for a European Call; see
+/// [`monte_carlo_greeks`].
+pub fn monte_carlo_price<R: Rng>(
+    spot: f64,
+    strike: f64,
+    rate: f64,
+    vol: f64,
+    time: f64,
+    num_paths: u64,
+    rng: &mut R,
+) -> MonteCarloResult {
+    monte_carlo_greeks(
+        &EuropeanCall { strike },
+        spot,
+        rate,
+        vol,
+        time,
+        num_paths,
+        rng,
+    )
 }

@@ -1,11 +1,13 @@
 # AdjointCore
 
 AdjointCore is a reverse-mode Adjoint Algorithmic Differentiation (AAD)
-engine, implemented from first principles in Rust. It prices a European Call
-option by Monte Carlo simulation and, within the same computation, recovers
-its Greeks (Delta, Vega, and Rho) from a single backward sweep per simulated
-path. The engine is exposed to Python through PyO3 and `maturin`, allowing
-it to be imported and called like any standard Python package once built.
+engine, implemented from first principles in Rust. It prices European calls,
+European puts, and arithmetic-average Asian calls by Monte Carlo simulation
+and, within the same computation, recovers their Greeks (Delta, Vega, and
+Rho) from a single backward sweep per simulated path. The engine is exposed
+to Python through PyO3 and `maturin` (currently the European call only),
+allowing it to be imported and called like any standard Python package once
+built.
 
 No external autodiff crate is used anywhere in this project. The tape, the
 Dual number, every operator overload, and the mathematical special
@@ -67,11 +69,24 @@ functions are all implemented in this repository.
   error is 2.6e-15, approximately six orders of magnitude tighter than the
   approximation it replaces.
 
+- **Payoffs (`src/payoff.rs`)**: A `Payoff` trait gives the number of
+  equally spaced fixing dates and the undiscounted payoff on the spot at
+  those dates. It is implemented by `EuropeanCall`, `EuropeanPut`, and
+  `AsianCall` (arithmetic average over the fixings, today's spot excluded).
+  Payoffs are written once against a small `Real` scalar trait implemented
+  for both `Dual` and `f64`. On `Dual` every step is recorded for the
+  adjoint sweep. On `f64` nothing is recorded, which gives a tape-free
+  revaluation (`monte_carlo_value`) that sees exactly the same paths for the
+  same seed. That revaluation is the bump-and-reval oracle.
+
 - **Monte Carlo pricer (`src/pricer.rs`)**: An Euler-Maruyama simulation of
-  geometric Brownian motion. Spot, Rate, and Volatility are recorded as
-  tape variables, allowing Delta, Rho, and Vega to be recovered from the
-  same sweep that produces the price. Strike and Time remain plain
-  constants, since no Greek is required with respect to either. The
+  geometric Brownian motion, applied to ln S, so each step between fixing
+  dates is the exact log-normal transition with no discretization bias.
+  `monte_carlo_greeks` is generic over the payoff. Spot, Rate, and
+  Volatility are recorded as tape variables, allowing Delta, Rho, and Vega
+  to be recovered from the same sweep that produces the price. Time and the
+  payoff's own terms (strike, fixings) remain plain constants, since no
+  Greek is required with respect to them. The
   standard error of each output quantity is tracked with a streaming
   accumulator (Welford's algorithm). The test suite verifies agreement
   with closed-form Black-Scholes to within five standard errors per
@@ -81,6 +96,24 @@ functions are all implemented in this repository.
 - **PyO3 bridge (`src/python.rs`)**: A single function, `mc_pricer`,
   returns `{"price", "delta", "vega", "rho"}` as a Python dictionary. Once
   built, the engine is accessible via `import adjoint_core`.
+
+## Where the pathwise estimator stops working
+
+Every Greek here is a pathwise estimator: the derivative of each simulated
+path's discounted payoff, averaged over paths. It is unbiased only when the
+payoff is continuous in the path (Lipschitz is enough), so that
+differentiating inside the expectation is allowed. Calls, puts, and
+arithmetic Asians qualify. Their kink at the strike has zero probability
+under a continuous distribution and contributes nothing.
+
+Discontinuous payoffs such as digitals and barriers do not qualify. Their
+pathwise derivative is zero on almost every path, because a small bump does
+not change which side of the strike or barrier a path lands on. Yet the true
+sensitivity comes entirely from the jump. The pathwise estimate would
+therefore be a confident, wrong zero (or a value missing the jump's
+contribution), and the engine deliberately does not offer such payoffs. They
+need a smoothed payoff, the likelihood-ratio method, or a conditional
+expectation step instead.
 
 ## Building
 
@@ -98,13 +131,17 @@ python main.py
 cargo test
 ```
 
-The suite comprises 40 tests across five modules: the tape's accumulation
+The suite comprises 49 tests across six modules: the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
 against closed-form Black-Scholes with an additional cross-seed consistency
-check, and handle validity (stale `Dual` and `Gradient` use after a reset,
-a second sweep, or on another thread is rejected).
+check, handle validity (stale `Dual` and `Gradient` use after a reset,
+a second sweep, or on another thread is rejected), and the payoffs:
+the put against closed-form Black-Scholes and put-call parity on common
+paths, and each Asian Greek against central-difference bump-and-reval with
+common random numbers. All Monte Carlo checks use a tolerance of five
+standard errors of the estimator under test.
 
 ## Benchmarking
 

@@ -5,7 +5,7 @@
 //! backward sweep that chains all those partials together — none of these
 //! operations knows or cares what expression it's sitting inside of.
 
-use std::ops::{Add, Div, Mul, Sub};
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::dual::Dual;
 use crate::special;
@@ -144,5 +144,12 @@ impl Div<Dual> for f64 {
     type Output = Dual;
     fn div(self, rhs: Dual) -> Dual {
         Dual::unary(self / rhs.value, rhs, -self / (rhs.value * rhs.value))
+    }
+}
+
+impl Neg for Dual {
+    type Output = Dual;
+    fn neg(self) -> Dual {
+        Dual::unary(-self.value, self, -1.0)
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod dual;
 pub mod ops;
+pub mod payoff;
 pub mod pricer;
 pub mod special;
 pub mod tape;
@@ -13,4 +14,8 @@ pub mod tape;
 mod python;
 
 pub use dual::{Dual, Gradient};
-pub use pricer::{Greeks, MonteCarloResult, black_scholes, monte_carlo_price};
+pub use payoff::{AsianCall, EuropeanCall, EuropeanPut, Payoff, Real};
+pub use pricer::{
+    Greeks, MonteCarloResult, black_scholes, black_scholes_put, monte_carlo_greeks,
+    monte_carlo_price, monte_carlo_value,
+};

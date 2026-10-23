@@ -293,3 +293,16 @@ fn repeated_variable_accumulates_through_multiple_ops() {
     assert_close(z.value, 35.0, "value");
     assert_close(grad.wrt(x), 12.0, "dz/dx");
 }
+
+// ---- Neg ----
+
+#[test]
+fn neg_dual() {
+    tape::reset();
+    let x = Dual::var(2.5);
+    let z = -x;
+    let grad = z.backward();
+
+    assert_close(z.value, -2.5, "value");
+    assert_close(grad.wrt(x), -1.0, "dz/dx");
+}
