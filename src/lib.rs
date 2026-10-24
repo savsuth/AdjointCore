@@ -18,7 +18,7 @@ pub use bump::bump_and_reval;
 pub use dual::{Dual, Gradient};
 pub use payoff::{AsianCall, EuropeanCall, EuropeanPut, Payoff, Real};
 pub use pricer::{
-    BucketedGreeks, BucketedResult, Greeks, MonteCarloResult, black_scholes, black_scholes_put,
-    monte_carlo_greeks, monte_carlo_greeks_bucketed, monte_carlo_price, monte_carlo_value,
-    monte_carlo_value_bucketed,
+    BucketedGreeks, BucketedResult, Greeks, MonteCarloResult, PathChunks, black_scholes,
+    black_scholes_put, monte_carlo_greeks, monte_carlo_greeks_bucketed,
+    monte_carlo_greeks_parallel, monte_carlo_price, monte_carlo_value, monte_carlo_value_bucketed,
 };

@@ -3,8 +3,10 @@
 //! Greeks a completely different way: pathwise adjoint differentiation
 //! instead of a closed-form formula.
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
+use rayon::prelude::*;
 
 use crate::dual::Dual;
 use crate::payoff::{EuropeanCall, Payoff, Real};
@@ -70,7 +72,7 @@ pub fn black_scholes_put(spot: f64, strike: f64, rate: f64, vol: f64, time: f64)
 /// report a Monte Carlo estimator's standard error without ever storing a
 /// single path's sample. Just O(1) state and no heap allocation, which fits
 /// right in with the rest of the pricer's zero-allocation hot loop.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct RunningStats {
     count: u64,
     mean: f64,
@@ -86,6 +88,26 @@ impl RunningStats {
         self.m2 += delta * delta2;
     }
 
+    /// Fold in another accumulator's samples, as if they had been fed to
+    /// `update` here. This is the pairwise combination of Chan, Golub and
+    /// LeVeque: the means combine weighted by count, and the squared
+    /// deviations pick up a correction for the gap between the two means.
+    fn merge(&mut self, other: &RunningStats) {
+        if other.count == 0 {
+            return;
+        }
+        if self.count == 0 {
+            *self = *other;
+            return;
+        }
+        let (n_a, n_b) = (self.count as f64, other.count as f64);
+        let n = n_a + n_b;
+        let delta = other.mean - self.mean;
+        self.mean += delta * n_b / n;
+        self.m2 += other.m2 + delta * delta * n_a * n_b / n;
+        self.count += other.count;
+    }
+
     /// Standard error of the mean — just sqrt(sample variance / n).
     fn standard_error(&self) -> f64 {
         if self.count < 2 {
@@ -98,7 +120,7 @@ impl RunningStats {
 
 /// Price and sensitivities of an option under a piecewise-constant vol
 /// curve: one vega per bucket, in bucket order.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BucketedGreeks {
     pub price: f64,
     pub delta: f64,
@@ -108,7 +130,7 @@ pub struct BucketedGreeks {
 
 /// A Monte Carlo estimate on a vol curve, with each quantity's own standard
 /// error attached, as in [`MonteCarloResult`].
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BucketedResult {
     pub greeks: BucketedGreeks,
     pub std_error: BucketedGreeks,
@@ -240,11 +262,129 @@ pub fn monte_carlo_greeks_bucketed<P: Payoff, R: Rng>(
     rng: &mut R,
 ) -> BucketedResult {
     let grid = time_grid(payoff.fixings(), vols.len(), time);
+    accumulate_greeks(payoff, &grid, spot, rate, vols, num_paths, rng).into_result()
+}
 
-    let mut price_stats = RunningStats::default();
-    let mut delta_stats = RunningStats::default();
-    let mut rho_stats = RunningStats::default();
-    let mut vega_stats: Vec<RunningStats> = vols.iter().map(|_| RunningStats::default()).collect();
+/// What fixes the paths of a parallel run: the seed, and how many paths go
+/// in each chunk. It stands where the generator stands in the serial API.
+#[derive(Clone, Copy, Debug)]
+pub struct PathChunks {
+    pub seed: u64,
+    pub chunk_size: u64,
+}
+
+/// The same estimate as [`monte_carlo_greeks_bucketed`], with the paths
+/// split into chunks of `chunks.chunk_size` and the chunks priced in
+/// parallel on the current rayon thread pool.
+///
+/// Chunk `c` draws from its own generator, keyed by (`seed`, `c`), and runs
+/// on whichever worker picks it up, recording on that worker's thread-local
+/// tape. The per-chunk accumulators are then merged in chunk order. Which
+/// paths exist and the order their statistics combine in depend only on
+/// the seed, the chunk size, and `num_paths`, so the result is bit-identical at
+/// any thread count. A different `chunk_size` gives different paths, and so
+/// a different (equally valid) estimate.
+pub fn monte_carlo_greeks_parallel<P: Payoff + Sync>(
+    payoff: &P,
+    spot: f64,
+    rate: f64,
+    vols: &[f64],
+    time: f64,
+    num_paths: u64,
+    chunks: PathChunks,
+) -> BucketedResult {
+    let PathChunks { seed, chunk_size } = chunks;
+    assert!(chunk_size > 0, "chunk_size must be at least one path");
+    let grid = time_grid(payoff.fixings(), vols.len(), time);
+    let num_chunks = num_paths.div_ceil(chunk_size);
+
+    let mut priced: Vec<(u64, GreeksStats)> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk| {
+            let paths = chunk_size.min(num_paths - chunk * chunk_size);
+            let mut rng = chunk_rng(seed, chunk);
+            let stats = accumulate_greeks(payoff, &grid, spot, rate, vols, paths, &mut rng);
+            (chunk, stats)
+        })
+        .collect();
+    // Merge in chunk order whatever order the workers finished in.
+    priced.sort_unstable_by_key(|&(chunk, _)| chunk);
+
+    let mut total = GreeksStats::new(vols.len());
+    for (_, stats) in &priced {
+        total.merge(stats);
+    }
+    total.into_result()
+}
+
+/// The generator for one chunk of paths: ChaCha12 (`StdRng`) keyed by the
+/// seed and the chunk index. Distinct (seed, chunk) pairs are distinct keys,
+/// so no two chunks share a stream.
+fn chunk_rng(seed: u64, chunk: u64) -> StdRng {
+    let mut key = [0u8; 32];
+    key[..8].copy_from_slice(&seed.to_le_bytes());
+    key[8..16].copy_from_slice(&chunk.to_le_bytes());
+    StdRng::from_seed(key)
+}
+
+/// Running statistics of every output the adjoint pricer reports.
+#[derive(Clone)]
+struct GreeksStats {
+    price: RunningStats,
+    delta: RunningStats,
+    rho: RunningStats,
+    vegas: Vec<RunningStats>,
+}
+
+impl GreeksStats {
+    fn new(buckets: usize) -> Self {
+        GreeksStats {
+            price: RunningStats::default(),
+            delta: RunningStats::default(),
+            rho: RunningStats::default(),
+            vegas: vec![RunningStats::default(); buckets],
+        }
+    }
+
+    fn merge(&mut self, other: &GreeksStats) {
+        self.price.merge(&other.price);
+        self.delta.merge(&other.delta);
+        self.rho.merge(&other.rho);
+        for (mine, theirs) in self.vegas.iter_mut().zip(&other.vegas) {
+            mine.merge(theirs);
+        }
+    }
+
+    fn into_result(self) -> BucketedResult {
+        BucketedResult {
+            greeks: BucketedGreeks {
+                price: self.price.mean,
+                delta: self.delta.mean,
+                rho: self.rho.mean,
+                vegas: self.vegas.iter().map(|v| v.mean).collect(),
+            },
+            std_error: BucketedGreeks {
+                price: self.price.standard_error(),
+                delta: self.delta.standard_error(),
+                rho: self.rho.standard_error(),
+                vegas: self.vegas.iter().map(|v| v.standard_error()).collect(),
+            },
+        }
+    }
+}
+
+/// Price `num_paths` paths with one adjoint sweep each, on this thread's
+/// tape, and return the running statistics of every output.
+fn accumulate_greeks<P: Payoff, R: Rng>(
+    payoff: &P,
+    grid: &TimeGrid,
+    spot: f64,
+    rate: f64,
+    vols: &[f64],
+    num_paths: u64,
+    rng: &mut R,
+) -> GreeksStats {
+    let mut stats = GreeksStats::new(vols.len());
     let mut vol_vars = Vec::with_capacity(vols.len());
     let mut path = Vec::with_capacity(payoff.fixings());
 
@@ -254,33 +394,20 @@ pub fn monte_carlo_greeks_bucketed<P: Payoff, R: Rng>(
         vol_vars.clear();
         vol_vars.extend(vols.iter().map(|&v| Dual::var(v)));
 
-        let discounted = discounted_payoff(payoff, &grid, s, r, &vol_vars, &mut path, rng);
+        let discounted = discounted_payoff(payoff, grid, s, r, &vol_vars, &mut path, rng);
         let grad = discounted.backward();
 
-        price_stats.update(discounted.value);
-        delta_stats.update(grad.wrt(s));
-        rho_stats.update(grad.wrt(r));
-        for (stats, &vol) in vega_stats.iter_mut().zip(&vol_vars) {
-            stats.update(grad.wrt(vol));
+        stats.price.update(discounted.value);
+        stats.delta.update(grad.wrt(s));
+        stats.rho.update(grad.wrt(r));
+        for (vega, &vol) in stats.vegas.iter_mut().zip(&vol_vars) {
+            vega.update(grad.wrt(vol));
         }
 
         tape::reset();
     }
 
-    BucketedResult {
-        greeks: BucketedGreeks {
-            price: price_stats.mean,
-            delta: delta_stats.mean,
-            rho: rho_stats.mean,
-            vegas: vega_stats.iter().map(|v| v.mean).collect(),
-        },
-        std_error: BucketedGreeks {
-            price: price_stats.standard_error(),
-            delta: delta_stats.standard_error(),
-            rho: rho_stats.standard_error(),
-            vegas: vega_stats.iter().map(|v| v.standard_error()).collect(),
-        },
-    }
+    stats
 }
 
 /// Monte Carlo price of `payoff` under a piecewise-constant vol curve with
@@ -369,4 +496,40 @@ pub fn monte_carlo_price<R: Rng>(
         num_paths,
         rng,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Merging two accumulators has to give what one accumulator fed every
+    /// sample would, including when either side is empty.
+    #[test]
+    fn merged_running_stats_match_one_sequential_pass() {
+        let samples: Vec<f64> = (0..1_000)
+            .map(|i| ((i * 7919) % 1_000) as f64 * 0.37 - 50.0)
+            .collect();
+
+        let mut sequential = RunningStats::default();
+        samples.iter().for_each(|&x| sequential.update(x));
+
+        for split in [0, 1, 333, 999, 1_000] {
+            let (mut a, mut b) = (RunningStats::default(), RunningStats::default());
+            samples[..split].iter().for_each(|&x| a.update(x));
+            samples[split..].iter().for_each(|&x| b.update(x));
+            a.merge(&b);
+
+            assert_eq!(a.count, sequential.count, "split {split}");
+            assert!(
+                (a.mean - sequential.mean).abs() < 1e-12,
+                "split {split} mean"
+            );
+            assert!(
+                (a.m2 - sequential.m2).abs() < 1e-9 * sequential.m2,
+                "split {split} m2: {} vs {}",
+                a.m2,
+                sequential.m2
+            );
+        }
+    }
 }

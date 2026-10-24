@@ -3,8 +3,10 @@
 AdjointCore is a reverse-mode Adjoint Algorithmic Differentiation (AAD)
 engine, implemented from first principles in Rust. It prices European calls,
 European puts, and arithmetic-average Asian calls by Monte Carlo simulation
-and, within the same computation, recovers their Greeks (Delta, Vega, and
-Rho) from a single backward sweep per simulated path. The engine is exposed
+and, within the same computation, recovers their Greeks (Delta, Rho, and
+one Vega per bucket of a piecewise-constant volatility curve) from a single
+backward sweep per simulated path. Paths run in parallel across threads
+with results that do not depend on the thread count. The engine is exposed
 to Python through PyO3 and `maturin` (currently the European call),
 allowing it to be imported and called like any standard Python package once
 built.
@@ -52,7 +54,7 @@ functions are all implemented in this repository.
 
 - **Operators (`src/ops.rs`)**: `Add`, `Sub`, `Mul`, and `Div` are
   implemented across all three relevant operand shapes (`Dual op Dual`,
-  `Dual op f64`, `f64 op Dual`). The engine also supports `exp`, `sqrt`,
+  `Dual op f64`, `f64 op Dual`), plus unary `Neg`. The engine also supports `exp`, `sqrt`,
   `ln`, `norm_cdf`, and `max_zero` (the option payoff kink, whose
   subgradient is taken as 0 exactly at the kink itself).
 
@@ -104,6 +106,25 @@ functions are all implemented in this repository.
   pricer, and the results are bit-identical. The flat `monte_carlo_greeks`
   is now that one-bucket case.
 
+- **Parallel paths (`src/pricer.rs`)**: `monte_carlo_greeks_parallel`
+  splits the paths into fixed-size chunks and prices them on the current
+  rayon thread pool. The chunks are described by `PathChunks { seed,
+  chunk_size }`. Each chunk draws from its own `StdRng` (ChaCha12), keyed by
+  the seed and the chunk index, so no two chunks share a stream. Each chunk
+  records on the thread-local tape of whichever worker runs it, so no tape
+  is ever shared. Each chunk keeps its own Welford accumulators. These are
+  merged in chunk order with the pairwise formula of Chan, Golub, and
+  LeVeque, which combines means weighted by count and corrects the squared
+  deviations for the gap between the means. Which paths exist, and the order
+  their statistics combine in, depend only on the seed, the chunk size, and
+  the path count, so the result is bit-identical on any number of threads.
+
+- **Bump-and-reval (`src/bump.rs`)**: The baseline the adjoint pricer is
+  measured against, with no adjoint code involved. It takes central
+  differences of the tape-free pricer, re-seeding every revaluation so all
+  of them see the same paths, which costs 2N + 5 valuations for N vol
+  buckets.
+
 - **PyO3 bridge (`src/python.rs`)**: `mc_pricer` returns
   `{"price", "delta", "vega", "rho"}` for a European Call under a flat
   volatility. `mc_pricer_buckets` takes a list of bucket volatilities and
@@ -129,6 +150,16 @@ contribution), and the engine deliberately does not offer such payoffs. They
 need a smoothed payoff, the likelihood-ratio method, or a conditional
 expectation step instead.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push and pull request, on
+`ubuntu-latest`. It runs two jobs:
+
+- `cargo test --release`;
+- a maturin build check: build the wheel, install it, and import it.
+
+There is no deploy step.
+
 ## Building
 
 ```bash
@@ -142,10 +173,11 @@ python main.py
 ## Testing
 
 ```bash
-cargo test
+cargo test --release
 ```
 
-The suite comprises 58 tests across eight modules: the tape's accumulation
+The suite comprises 62 tests: one unit test of the accumulator merge and 61
+integration tests across nine modules. They cover the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
@@ -167,6 +199,13 @@ common random numbers. The volatility curve is checked as follows:
 `bump_and_reval` is checked against the adjoint Greeks on the same seed,
 for a European and an Asian call on vol curves, and its price must equal the
 adjoint price exactly.
+
+The parallel pricer must give bit-identical results on 1, 2, 4, and 8
+threads (20,500 paths, so the last chunk is partial). It must also match
+Black-Scholes at the integrated-variance volatility, and two chunk sizes must
+give statistically consistent estimates with matching standard errors. The
+merged accumulator must equal one sequential pass, including when either
+side is empty.
 
 All Monte Carlo checks use a tolerance of five standard errors of the
 estimator under test.
@@ -232,6 +271,33 @@ What the numbers say:
   run, made before the tape column was added and with other load on the
   machine, gave a bump median of 3625.1 ms with a max of 5555.7 ms. The AAD
   column was stable within about 1 ms across all three runs.
+
+### Parallel paths
+
+```bash
+cargo run --release --example parallel
+```
+
+`examples/parallel.rs` prices the same Asian call on a 100-bucket curve (102
+sensitivities) on 100,000 paths in chunks of 1,000, with seed 42. Each
+thread count runs on a dedicated rayon pool of that size, with one discarded
+warm-up and five timed runs. Measured on 2026-10-23 on the same Apple M4,
+which has 4 performance and 6 efficiency cores:
+
+| threads | AAD ms (median [min, max]) | speedup vs 1 thread | identical to 1 thread |
+|---|---|---|---|
+| 1 | 757.5 [755.5, 758.5] | 1.00 | true |
+| 2 | 386.6 [384.7, 391.5] | 1.96 | true |
+| 4 | 207.2 [196.4, 226.5] | 3.66 | true |
+| 8 | 119.2 [118.3, 138.5] | 6.35 | true |
+| 10 | 107.1 [100.3, 131.4] | 7.07 | true |
+
+The serial pricer, with no chunks and no pool, took 758.2 ms
+[757.9, 758.4], so chunking costs nothing measurable. Scaling is close to
+linear up to 4 threads. Beyond that, the extra threads land on efficiency
+cores, which are slower, so 10 threads give 7.07x rather than 10x. A second
+run gave 1.97x, 3.73x, 6.35x, and 7.09x at 2, 4, 8, and 10 threads. Every
+parallel result was bit-identical to the one-thread result.
 
 ### Python call latency
 
