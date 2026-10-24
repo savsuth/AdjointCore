@@ -55,6 +55,18 @@ impl Dual {
             Dual::unary(0.0, self, 0.0)
         }
     }
+
+    /// The step 1{x > 0}, the jump in a digital or barrier payoff.
+    ///
+    /// Its derivative is 0 everywhere except at the jump, where it has none,
+    /// so the partial recorded is 0. That is exactly what a pathwise sweep
+    /// sees of a jump, nothing: the sensitivity a digital owes to its jump
+    /// never reaches the adjoints. Smooth the step first (see
+    /// [`crate::DigitalCall`]) when its Greeks are wanted.
+    pub fn step(self) -> Dual {
+        let value = if self.value > 0.0 { 1.0 } else { 0.0 };
+        Dual::unary(value, self, 0.0)
+    }
 }
 
 impl Add<Dual> for Dual {

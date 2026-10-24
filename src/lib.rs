@@ -17,10 +17,13 @@ mod python;
 
 pub use bump::bump_and_reval;
 pub use dual::{Dual, Gradient};
-pub use payoff::{AsianCall, EuropeanCall, EuropeanPut, GeometricAsianCall, Payoff, Real};
+pub use payoff::{
+    AsianCall, DigitalCall, EuropeanCall, EuropeanPut, GeometricAsianCall, Payoff, Real,
+    UpAndOutCall,
+};
 pub use pricer::{
     BucketedGreeks, BucketedResult, Greeks, Market, MonteCarloResult, PathChunks, black_scholes,
-    black_scholes_put, monte_carlo_greeks, monte_carlo_greeks_bucketed,
+    black_scholes_digital, black_scholes_put, monte_carlo_greeks, monte_carlo_greeks_bucketed,
     monte_carlo_greeks_parallel, monte_carlo_price, monte_carlo_value, monte_carlo_value_bucketed,
 };
 pub use variance::{VarianceReduction, geometric_asian_call, monte_carlo_greeks_reduced};

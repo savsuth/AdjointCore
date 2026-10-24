@@ -68,6 +68,27 @@ pub fn black_scholes_put(spot: f64, strike: f64, rate: f64, vol: f64, time: f64)
     }
 }
 
+/// Closed-form Black-Scholes price and Greeks of a cash-or-nothing digital
+/// call paying 1{S_T > K}, the reference for the smoothed Monte Carlo
+/// digital. Price e^{-rT} N(d2); each Greek is that differentiated through
+/// d2, whose partials are 1 / (S vol sqrt(T)) in spot, -d1 / vol in vol and
+/// sqrt(T) / vol in rate. Plain `f64`, like [`black_scholes`].
+pub fn black_scholes_digital(spot: f64, strike: f64, rate: f64, vol: f64, time: f64) -> Greeks {
+    let sqrt_t = time.sqrt();
+    let d1 = ((spot / strike).ln() + (rate + 0.5 * vol * vol) * time) / (vol * sqrt_t);
+    let d2 = d1 - vol * sqrt_t;
+
+    let discount = (-rate * time).exp();
+    let density = discount * norm_pdf(d2);
+
+    Greeks {
+        price: discount * norm_cdf(d2),
+        delta: density / (spot * vol * sqrt_t),
+        vega: -density * d1 / vol,
+        rho: -time * discount * norm_cdf(d2) + density * sqrt_t / vol,
+    }
+}
+
 /// Streaming mean and variance, using Welford's algorithm — this lets us
 /// report a Monte Carlo estimator's standard error without ever storing a
 /// single path's sample. Just O(1) state and no heap allocation, which fits
