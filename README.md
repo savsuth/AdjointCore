@@ -119,6 +119,24 @@ functions are all implemented in this repository.
   their statistics combine in, depend only on the seed, the chunk size, and
   the path count, so the result is bit-identical on any number of threads.
 
+- **Variance reduction (`src/variance.rs`)**: `monte_carlo_greeks_reduced`
+  takes a `VarianceReduction { antithetic, control_variate }`. Both
+  reductions apply to the price and to every Greek.
+  - **Antithetic.** Each path is paired with its mirror, every normal
+    negated. Both legs are recorded on one tape and their average is swept
+    once, so a pair costs one backward sweep.
+  - **Control variate.** The geometric-average Asian call on the same path
+    (Kemna and Vorst), with coefficient 1. Its expectation has a closed form
+    even on the piecewise-constant volatility curve, because ln G is normal
+    with a mean and variance that accumulate along the same merged grid.
+  - **The closed form is on the tape.** `geometric_asian_call` writes it in
+    `Dual` arithmetic and records it once, so one sweep gives its exact
+    Greeks. The controlled estimator samples payoff minus control along the
+    paths and adds those exact Greeks back.
+  - **Why a fixed coefficient.** It keeps the estimator unbiased for the
+    price and every Greek. An estimated optimal coefficient would add an
+    O(1/n) bias.
+
 - **Bump-and-reval (`src/bump.rs`)**: The baseline the adjoint pricer is
   measured against, with no adjoint code involved. It takes central
   differences of the tape-free pricer, re-seeding every revaluation so all
@@ -176,8 +194,8 @@ python main.py
 cargo test --release
 ```
 
-The suite comprises 62 tests: one unit test of the accumulator merge and 61
-integration tests across nine modules. They cover the tape's accumulation
+The suite comprises 69 tests: one unit test of the accumulator merge and 68
+integration tests across ten modules. They cover the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
@@ -298,6 +316,64 @@ linear up to 4 threads. Beyond that, the extra threads land on efficiency
 cores, which are slower, so 10 threads give 7.07x rather than 10x. A second
 run gave 1.97x, 3.73x, 6.35x, and 7.09x at 2, 4, 8, and 10 threads. Every
 parallel result was bit-identical to the one-thread result.
+
+### Variance reduction
+
+```bash
+cargo run --release --example variance_reduction
+```
+
+`examples/variance_reduction.rs` prices a 12-fixing arithmetic Asian call
+(S = 100, r = 5%, T = 1, 5-bucket vol curve 18/22/20/25/15%) at three
+strikes. Every method uses 100,000 simulated paths from seed 42 (antithetic:
+50,000 pairs). VR is the variance reduction factor, (plain SE / method SE)^2:
+how many times more plain paths the same standard error would need. The
+vegas column gives the smallest and largest VR across the five buckets. Time
+is the median of five runs. Efficiency is the price VR times
+(plain time / method time). Measured on 2026-10-24 on the same Apple M4.
+
+| K | method | price | price SE | VR price | VR delta | VR rho | VR vegas [min, max] | ms | efficiency |
+|---|---|---|---|---|---|---|---|---|---|
+| 90 | plain | 12.9684 | 0.03484 | 1.0 | 1.0 | 1.0 | [1.0, 1.0] | 170.2 | 1.0 |
+| 90 | antithetic | 12.9206 | 0.01282 | 7.4 | 2.2 | 0.9 | [2.5, 3.3] | 147.7 | 8.5 |
+| 90 | control | 12.9202 | 0.00123 | 808.1 | 29.9 | 14.6 | [52.0, 203.4] | 181.7 | 756.9 |
+| 90 | both | 12.9183 | 0.00116 | 909.9 | 29.4 | 15.1 | [47.1, 214.4] | 182.0 | 851.2 |
+| 100 | plain | 6.1918 | 0.02708 | 1.0 | 1.0 | 1.0 | [1.0, 1.0] | 140.3 | 1.0 |
+| 100 | antithetic | 6.1654 | 0.01879 | 2.1 | 6.9 | 3.6 | [1.2, 1.3] | 131.5 | 2.2 |
+| 100 | control | 6.1644 | 0.00127 | 455.1 | 40.7 | 26.4 | [32.6, 84.2] | 194.9 | 327.6 |
+| 100 | both | 6.1628 | 0.00106 | 658.2 | 39.9 | 27.3 | [34.0, 82.3] | 151.1 | 611.3 |
+| 110 | plain | 2.3241 | 0.01723 | 1.0 | 1.0 | 1.0 | [1.0, 1.0] | 104.5 | 1.0 |
+| 110 | antithetic | 2.3056 | 0.01559 | 1.2 | 1.6 | 1.6 | [1.0, 1.1] | 99.4 | 1.3 |
+| 110 | control | 2.3057 | 0.00126 | 186.2 | 28.5 | 20.9 | [18.4, 56.8] | 124.3 | 156.5 |
+| 110 | both | 2.3042 | 0.00114 | 228.3 | 28.3 | 21.3 | [18.6, 60.8] | 126.8 | 188.3 |
+
+What the numbers say:
+
+- **The control variate does almost all the work.** It cuts the price
+  variance 186x to 808x, Delta and Rho variance 15x to 41x, and bucket-vega
+  variance 18x to 203x. Its extra cost is 7% to 39% more time, from one
+  logarithm per fixing on the tape plus the subtraction, so per unit of
+  compute it is worth 157x to 757x on the price.
+- **The reduction depends on the strike.** It is largest in the money,
+  where both averages are almost always above the strike and their payoffs
+  move together nearly linearly. It is smallest out of the money, where the
+  kink sits in a different place for the arithmetic and the geometric
+  average.
+- **Antithetic sampling is weak on its own, and can hurt.** It reduces price
+  variance 1.2x to 7.4x, and less out of the money, where both legs of most
+  pairs pay zero. On the K = 90 Rho it is slightly worse than plain
+  (VR 0.9): mirroring only helps a quantity that moves roughly monotonically
+  with the normals, which that pathwise estimator does not.
+- **Combining the two mostly helps the price.** The combination adds up to
+  1.45x on the price over the control alone, and leaves the Greeks about
+  where the control put them.
+- **Correctness.** All four methods' Greeks agree with each other within
+  their combined standard errors (`tests/variance_reduction.rs`). With one
+  fixing, the control is the European call itself, so the controlled
+  estimator returns Black-Scholes with a standard error below 1e-10.
+- **Repeatability.** A second run gave identical VR columns (fixed seed).
+  Times differed by up to 32 ms per method; the largest gap was K = 100
+  control, 194.9 ms against 162.9 ms.
 
 ### Python call latency
 

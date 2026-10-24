@@ -138,18 +138,18 @@ pub struct BucketedResult {
 
 /// One step of the simulation grid. Every step lies inside a single vol
 /// bucket, so the exact log-normal transition applies with that bucket's vol.
-struct Step {
-    bucket: usize,
-    dt: f64,
+pub(crate) struct Step {
+    pub(crate) bucket: usize,
+    pub(crate) dt: f64,
     sqrt_dt: f64,
     /// Whether the step ends on one of the payoff's fixing dates.
-    fixing: bool,
+    pub(crate) fixing: bool,
 }
 
 /// The simulation grid out to maturity, which is also the discounting date.
-struct TimeGrid {
-    steps: Vec<Step>,
-    maturity: f64,
+pub(crate) struct TimeGrid {
+    pub(crate) steps: Vec<Step>,
+    pub(crate) maturity: f64,
 }
 
 /// The payoff's fixing dates merged with the vol buckets' edges.
@@ -158,7 +158,7 @@ struct TimeGrid {
 /// T / (n N) both are integers (i N and j n) and merge exactly, with no
 /// floating-point comparison of times. With one bucket this is the uniform
 /// fixing grid, and dt = T / n computed exactly as the flat pricer did.
-fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
+pub(crate) fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
     assert!(fixings > 0, "a payoff needs at least one fixing date");
     assert!(buckets > 0, "a vol curve needs at least one bucket");
     let units = fixings * buckets;
@@ -195,25 +195,26 @@ fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
 /// The spot moves along `grid` by the exact log-normal step
 /// S * exp((r - vol^2 / 2) dt + vol sqrt(dt) z), which is Euler-Maruyama on
 /// ln S and has no discretization bias for GBM with piecewise-constant vol.
-/// Each step draws one normal from `rng` in date order, so two runs on the
-/// same seed see the same paths whatever scalar type they are in. `path` is
-/// a buffer reused across paths; after the first path it never reallocates.
+/// `normals` holds one standard normal per grid step, in date order; callers
+/// draw them from their generator in that order, so two runs on the same
+/// seed see the same paths whatever scalar type they are in. `path` is a
+/// buffer reused across paths; after the first path it never reallocates.
 ///
 /// The drift and vol sqrt(dt) terms are recorded once per run of steps with
 /// the same bucket and dt, not once per step, which keeps the tape short.
-fn discounted_payoff<T: Real, P: Payoff, R: Rng>(
+fn discounted_payoff<T: Real, P: Payoff>(
     payoff: &P,
     grid: &TimeGrid,
     spot: T,
     rate: T,
     vols: &[T],
+    normals: &[f64],
     path: &mut Vec<T>,
-    rng: &mut R,
 ) -> T {
     path.clear();
     let mut s = spot;
     let mut segment: Option<(usize, f64, T, T)> = None;
-    for step in &grid.steps {
+    for (step, &z) in grid.steps.iter().zip(normals) {
         let (drift, vol_sqrt_dt) = match segment {
             Some((bucket, dt, drift, vol_sqrt_dt)) if bucket == step.bucket && dt == step.dt => {
                 (drift, vol_sqrt_dt)
@@ -226,7 +227,6 @@ fn discounted_payoff<T: Real, P: Payoff, R: Rng>(
                 (drift, vol_sqrt_dt)
             }
         };
-        let z: f64 = StandardNormal.sample(rng);
         s = s * (drift + vol_sqrt_dt * z).exp();
         if step.fixing {
             path.push(s);
@@ -262,7 +262,24 @@ pub fn monte_carlo_greeks_bucketed<P: Payoff, R: Rng>(
     rng: &mut R,
 ) -> BucketedResult {
     let grid = time_grid(payoff.fixings(), vols.len(), time);
-    accumulate_greeks(payoff, &grid, spot, rate, vols, num_paths, rng).into_result()
+    let market = Market {
+        spot,
+        rate,
+        vols,
+        time,
+    };
+    accumulate_greeks(payoff, &grid, &market, num_paths, rng, false).into_result()
+}
+
+/// The market inputs a pricing run differentiates against: spot, the
+/// continuously compounded rate, and the piecewise-constant vol curve (one
+/// vol per equal bucket of [0, `time`]), plus the maturity.
+#[derive(Clone, Copy, Debug)]
+pub struct Market<'a> {
+    pub spot: f64,
+    pub rate: f64,
+    pub vols: &'a [f64],
+    pub time: f64,
 }
 
 /// What fixes the paths of a parallel run: the seed, and how many paths go
@@ -303,7 +320,13 @@ pub fn monte_carlo_greeks_parallel<P: Payoff + Sync>(
         .map(|chunk| {
             let paths = chunk_size.min(num_paths - chunk * chunk_size);
             let mut rng = chunk_rng(seed, chunk);
-            let stats = accumulate_greeks(payoff, &grid, spot, rate, vols, paths, &mut rng);
+            let market = Market {
+                spot,
+                rate,
+                vols,
+                time,
+            };
+            let stats = accumulate_greeks(payoff, &grid, &market, paths, &mut rng, false);
             (chunk, stats)
         })
         .collect();
@@ -329,7 +352,7 @@ fn chunk_rng(seed: u64, chunk: u64) -> StdRng {
 
 /// Running statistics of every output the adjoint pricer reports.
 #[derive(Clone)]
-struct GreeksStats {
+pub(crate) struct GreeksStats {
     price: RunningStats,
     delta: RunningStats,
     rho: RunningStats,
@@ -355,7 +378,7 @@ impl GreeksStats {
         }
     }
 
-    fn into_result(self) -> BucketedResult {
+    pub(crate) fn into_result(self) -> BucketedResult {
         BucketedResult {
             greeks: BucketedGreeks {
                 price: self.price.mean,
@@ -373,28 +396,45 @@ impl GreeksStats {
     }
 }
 
-/// Price `num_paths` paths with one adjoint sweep each, on this thread's
+/// Draw one standard normal per grid step, in date order.
+fn draw_normals<R: Rng>(normals: &mut [f64], rng: &mut R) {
+    for z in normals {
+        *z = StandardNormal.sample(rng);
+    }
+}
+
+/// Price `samples` samples with one adjoint sweep each, on this thread's
 /// tape, and return the running statistics of every output.
-fn accumulate_greeks<P: Payoff, R: Rng>(
+///
+/// A sample is one path, or with `antithetic` a path and its mirror (every
+/// normal negated). Both legs of a pair go on the same tape and their
+/// average is swept once, so the pair costs one backward sweep.
+pub(crate) fn accumulate_greeks<P: Payoff, R: Rng>(
     payoff: &P,
     grid: &TimeGrid,
-    spot: f64,
-    rate: f64,
-    vols: &[f64],
-    num_paths: u64,
+    market: &Market,
+    samples: u64,
     rng: &mut R,
+    antithetic: bool,
 ) -> GreeksStats {
-    let mut stats = GreeksStats::new(vols.len());
-    let mut vol_vars = Vec::with_capacity(vols.len());
+    let mut stats = GreeksStats::new(market.vols.len());
+    let mut vol_vars = Vec::with_capacity(market.vols.len());
     let mut path = Vec::with_capacity(payoff.fixings());
+    let mut normals = vec![0.0; grid.steps.len()];
 
-    for _ in 0..num_paths {
-        let s = Dual::var(spot);
-        let r = Dual::var(rate);
+    for _ in 0..samples {
+        let s = Dual::var(market.spot);
+        let r = Dual::var(market.rate);
         vol_vars.clear();
-        vol_vars.extend(vols.iter().map(|&v| Dual::var(v)));
+        vol_vars.extend(market.vols.iter().map(|&v| Dual::var(v)));
 
-        let discounted = discounted_payoff(payoff, grid, s, r, &vol_vars, &mut path, rng);
+        draw_normals(&mut normals, rng);
+        let mut discounted = discounted_payoff(payoff, grid, s, r, &vol_vars, &normals, &mut path);
+        if antithetic {
+            normals.iter_mut().for_each(|z| *z = -*z);
+            let mirror = discounted_payoff(payoff, grid, s, r, &vol_vars, &normals, &mut path);
+            discounted = (discounted + mirror) * 0.5;
+        }
         let grad = discounted.backward();
 
         stats.price.update(discounted.value);
@@ -428,10 +468,12 @@ pub fn monte_carlo_value_bucketed<P: Payoff, R: Rng>(
     let grid = time_grid(payoff.fixings(), vols.len(), time);
     let mut price_stats = RunningStats::default();
     let mut path = Vec::with_capacity(payoff.fixings());
+    let mut normals = vec![0.0; grid.steps.len()];
 
     for _ in 0..num_paths {
+        draw_normals(&mut normals, rng);
         price_stats.update(discounted_payoff(
-            payoff, &grid, spot, rate, vols, &mut path, rng,
+            payoff, &grid, spot, rate, vols, &normals, &mut path,
         ));
     }
 

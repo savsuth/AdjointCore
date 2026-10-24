@@ -29,6 +29,7 @@ pub trait Real:
     + Div<f64, Output = Self>
 {
     fn exp(self) -> Self;
+    fn ln(self) -> Self;
     /// max(x, 0), with the subgradient at 0 taken as 0 (see `Dual::max_zero`).
     fn max_zero(self) -> Self;
 }
@@ -36,6 +37,10 @@ pub trait Real:
 impl Real for f64 {
     fn exp(self) -> f64 {
         f64::exp(self)
+    }
+
+    fn ln(self) -> f64 {
+        f64::ln(self)
     }
 
     fn max_zero(self) -> f64 {
@@ -46,6 +51,10 @@ impl Real for f64 {
 impl Real for Dual {
     fn exp(self) -> Dual {
         Dual::exp(self)
+    }
+
+    fn ln(self) -> Dual {
+        Dual::ln(self)
     }
 
     fn max_zero(self) -> Dual {
@@ -61,6 +70,13 @@ pub trait Payoff {
 
     /// The payoff given the spot at each fixing date, in date order.
     fn value<T: Real>(&self, path: &[T]) -> T;
+
+    /// A control variate for this payoff: the geometric-average Asian call
+    /// on the same fixings, whose expectation has a closed form. `None` when
+    /// it would not track the payoff (a put, say).
+    fn geometric_control(&self) -> Option<GeometricAsianCall> {
+        None
+    }
 }
 
 /// max(S_T - K, 0).
@@ -84,6 +100,17 @@ pub struct AsianCall {
     pub fixings: usize,
 }
 
+/// max(G - K, 0), where G is the geometric average of the spot over
+/// `fixings` equally spaced dates ending at T. Its log is normal under
+/// Black-Scholes, which is what gives it a closed form
+/// ([`crate::geometric_asian_call`]) and makes it the control variate for
+/// the arithmetic Asian.
+#[derive(Clone, Copy, Debug)]
+pub struct GeometricAsianCall {
+    pub strike: f64,
+    pub fixings: usize,
+}
+
 impl Payoff for EuropeanCall {
     fn fixings(&self) -> usize {
         1
@@ -91,6 +118,15 @@ impl Payoff for EuropeanCall {
 
     fn value<T: Real>(&self, path: &[T]) -> T {
         (path[path.len() - 1] - self.strike).max_zero()
+    }
+
+    /// With one fixing the geometric average is the terminal spot, so the
+    /// control is the call itself.
+    fn geometric_control(&self) -> Option<GeometricAsianCall> {
+        Some(GeometricAsianCall {
+            strike: self.strike,
+            fixings: 1,
+        })
     }
 }
 
@@ -112,5 +148,23 @@ impl Payoff for AsianCall {
     fn value<T: Real>(&self, path: &[T]) -> T {
         let sum = path[1..].iter().fold(path[0], |acc, &s| acc + s);
         (sum / path.len() as f64 - self.strike).max_zero()
+    }
+
+    fn geometric_control(&self) -> Option<GeometricAsianCall> {
+        Some(GeometricAsianCall {
+            strike: self.strike,
+            fixings: self.fixings,
+        })
+    }
+}
+
+impl Payoff for GeometricAsianCall {
+    fn fixings(&self) -> usize {
+        self.fixings
+    }
+
+    fn value<T: Real>(&self, path: &[T]) -> T {
+        let sum_ln = path[1..].iter().fold(path[0].ln(), |acc, &s| acc + s.ln());
+        ((sum_ln / path.len() as f64).exp() - self.strike).max_zero()
     }
 }
