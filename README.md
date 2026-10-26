@@ -202,8 +202,8 @@ python main.py
 cargo test --release
 ```
 
-The suite comprises 77 tests: one unit test of the accumulator merge and 76
-integration tests across eleven modules. They cover the tape's accumulation
+The suite comprises 83 tests: one unit test of the accumulator merge and 82
+integration tests across twelve modules. They cover the tape's accumulation
 and reset behavior, the normal CDF kernel verified against independently
 generated reference values, every operator and math function verified
 against its analytical derivative, the Monte Carlo engine verified
@@ -245,6 +245,22 @@ The smoothed payoffs are checked as follows:
 - An unreachable exact barrier reproduces the European call bit for bit.
 - The smoothed barrier's Delta, Rho, and bucket vegas match bump-and-reval
   of the same smoothed payoff on common random numbers.
+
+The netting-set CVA (`src/xva.rs`) is checked as follows:
+- Netting never raises CVA or expected exposure against the sum of the
+  trades' standalone values on common paths, and a fully offset set has CVA
+  and every sensitivity exactly zero.
+- A long-only set matches its closed form: its value is never negative, so
+  the expected discounted exposure at each date is today's value of the
+  trades still alive. CVA, Delta, Rho, each bucket vega, the hazard-rate
+  sensitivity, and the expected exposure profile are all checked.
+- With equal bucket vols, the bucket vegas sum to the flat Vega on common
+  paths.
+- A set's sensitivity to another counterparty's hazard rate is exactly zero,
+  and the total across sets is the sum of the sets.
+- The tape-free CVA reproduces the adjoint CVA bit for bit.
+- On mixed long and short sets, every sensitivity matches bump-and-reval on
+  common random numbers.
 
 All Monte Carlo checks use a tolerance of five standard errors of the
 estimator under test.

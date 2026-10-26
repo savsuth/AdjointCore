@@ -18,6 +18,7 @@
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use crate::dual::Dual;
+use crate::special;
 
 /// The arithmetic a payoff and the path simulation need, implemented for
 /// `Dual` (recorded on the tape) and for `f64` (not recorded).
@@ -26,6 +27,7 @@ pub trait Real:
     + Add<Output = Self>
     + Sub<Output = Self>
     + Mul<Output = Self>
+    + Div<Output = Self>
     + Neg<Output = Self>
     + Add<f64, Output = Self>
     + Sub<f64, Output = Self>
@@ -34,6 +36,9 @@ pub trait Real:
 {
     fn exp(self) -> Self;
     fn ln(self) -> Self;
+    fn sqrt(self) -> Self;
+    /// Standard normal cumulative distribution (see `Dual::norm_cdf`).
+    fn norm_cdf(self) -> Self;
     /// max(x, 0), with the subgradient at 0 taken as 0 (see `Dual::max_zero`).
     fn max_zero(self) -> Self;
     /// 1{x > 0}, with derivative 0 (see `Dual::step`).
@@ -47,6 +52,14 @@ impl Real for f64 {
 
     fn ln(self) -> f64 {
         f64::ln(self)
+    }
+
+    fn sqrt(self) -> f64 {
+        f64::sqrt(self)
+    }
+
+    fn norm_cdf(self) -> f64 {
+        special::norm_cdf(self)
     }
 
     fn max_zero(self) -> f64 {
@@ -65,6 +78,14 @@ impl Real for Dual {
 
     fn ln(self) -> Dual {
         Dual::ln(self)
+    }
+
+    fn sqrt(self) -> Dual {
+        Dual::sqrt(self)
+    }
+
+    fn norm_cdf(self) -> Dual {
+        Dual::norm_cdf(self)
     }
 
     fn max_zero(self) -> Dual {

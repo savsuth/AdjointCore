@@ -94,14 +94,14 @@ pub fn black_scholes_digital(spot: f64, strike: f64, rate: f64, vol: f64, time: 
 /// single path's sample. Just O(1) state and no heap allocation, which fits
 /// right in with the rest of the pricer's zero-allocation hot loop.
 #[derive(Clone, Copy, Default)]
-struct RunningStats {
+pub(crate) struct RunningStats {
     count: u64,
-    mean: f64,
+    pub(crate) mean: f64,
     m2: f64,
 }
 
 impl RunningStats {
-    fn update(&mut self, x: f64) {
+    pub(crate) fn update(&mut self, x: f64) {
         self.count += 1;
         let delta = x - self.mean;
         self.mean += delta / self.count as f64;
@@ -130,7 +130,7 @@ impl RunningStats {
     }
 
     /// Standard error of the mean — just sqrt(sample variance / n).
-    fn standard_error(&self) -> f64 {
+    pub(crate) fn standard_error(&self) -> f64 {
         if self.count < 2 {
             return f64::NAN;
         }
@@ -211,7 +211,7 @@ pub(crate) fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
     }
 }
 
-/// One path's discounted payoff, written once for both scalar types.
+/// One path's spot at each fixing date, written once for both scalar types.
 ///
 /// The spot moves along `grid` by the exact log-normal step
 /// S * exp((r - vol^2 / 2) dt + vol sqrt(dt) z), which is Euler-Maruyama on
@@ -223,15 +223,14 @@ pub(crate) fn time_grid(fixings: usize, buckets: usize, time: f64) -> TimeGrid {
 ///
 /// The drift and vol sqrt(dt) terms are recorded once per run of steps with
 /// the same bucket and dt, not once per step, which keeps the tape short.
-fn discounted_payoff<T: Real, P: Payoff>(
-    payoff: &P,
+pub(crate) fn simulate_fixings<T: Real>(
     grid: &TimeGrid,
     spot: T,
     rate: T,
     vols: &[T],
     normals: &[f64],
     path: &mut Vec<T>,
-) -> T {
+) {
     path.clear();
     let mut s = spot;
     let mut segment: Option<(usize, f64, T, T)> = None;
@@ -253,7 +252,20 @@ fn discounted_payoff<T: Real, P: Payoff>(
             path.push(s);
         }
     }
+}
 
+/// One path's discounted payoff: the spot at each fixing date from
+/// [`simulate_fixings`], then the payoff discounted from maturity.
+fn discounted_payoff<T: Real, P: Payoff>(
+    payoff: &P,
+    grid: &TimeGrid,
+    spot: T,
+    rate: T,
+    vols: &[T],
+    normals: &[f64],
+    path: &mut Vec<T>,
+) -> T {
+    simulate_fixings(grid, spot, rate, vols, normals, path);
     (rate * -grid.maturity).exp() * payoff.value(path)
 }
 
@@ -418,7 +430,7 @@ impl GreeksStats {
 }
 
 /// Draw one standard normal per grid step, in date order.
-fn draw_normals<R: Rng>(normals: &mut [f64], rng: &mut R) {
+pub(crate) fn draw_normals<R: Rng>(normals: &mut [f64], rng: &mut R) {
     for z in normals {
         *z = StandardNormal.sample(rng);
     }
