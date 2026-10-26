@@ -6,8 +6,11 @@ European puts, arithmetic-average Asian calls, and smoothed digital and
 up-and-out barrier calls by Monte Carlo simulation and, within the same
 computation, recovers their Greeks (Delta, Rho, and
 one Vega per bucket of a piecewise-constant volatility curve) from a single
-backward sweep per simulated path. Paths run in parallel across threads
-with results that do not depend on the thread count. The engine is exposed
+backward sweep per simulated path. It also computes the unilateral CVA of
+netting sets of European options, with every set's Delta, Rho, bucket
+vegas, and hazard-rate sensitivities from one recording per path. Paths run
+in parallel across threads with results that do not depend on the thread
+count. The engine is exposed
 to Python through PyO3 and `maturin` (currently the European call),
 allowing it to be imported and called like any standard Python package once
 built.
@@ -147,6 +150,30 @@ functions are all implemented in this repository.
   differences of the tape-free pricer, re-seeding every revaluation so all
   of them see the same paths, which costs 2N + 5 valuations for N vol
   buckets.
+
+- **Netting-set CVA (`src/xva.rs`)**: `monte_carlo_cva` takes netting sets of
+  European calls and puts with signed notionals. Each set faces one
+  counterparty with a flat hazard rate and a recovery rate. On exposure dates
+  t_j = jT/m, the CVA is
+  (1 - R) sum_j E[D(t_j) max(V(t_j), 0)] (e^{-lambda t_{j-1}} - e^{-lambda t_j}),
+  where V is the netted value of the trades still alive. Netting makes this
+  nonlinear, because max(sum v_i, 0) <= sum max(v_i, 0).
+  - **Future values.** Each trade's value at an exposure date is the
+    Black-Scholes closed form on the variance remaining on the bucket curve.
+    That is exact for piecewise-constant volatility, and it is written once
+    against `Real`.
+  - **Inputs on the tape.** Spot, rate, every bucket vol, and every set's
+    hazard rate are tape variables. They reach the CVA through the simulated
+    spot, the future values, the discount factors, and the default
+    probabilities.
+  - **One sweep per netting set.** Each path is recorded once and swept once
+    per set, which gives each set's CVA, Delta, Rho, bucket vegas, and
+    hazard-rate sensitivities, plus its expected exposure profile. The
+    exposure max(V, 0) is Lipschitz in the path, so the pathwise estimator
+    is unbiased.
+  - **Oracle.** `cva_value` is the tape-free revaluation on the same paths.
+    `bump_and_reval_cva` takes central differences of it at a cost of
+    2(N + K) + 5 valuations for N buckets and K sets.
 
 - **PyO3 bridge (`src/python.rs`)**: `mc_pricer` returns
   `{"price", "delta", "vega", "rho"}` for a European Call under a flat
@@ -526,6 +553,106 @@ What the numbers say:
   bias.
 - **Repeatability.** A second run gave identical output (fixed seeds,
   parallel results merged in chunk and seed order).
+
+### Netting-set CVA: AAD against bump-and-reval
+
+```bash
+cargo run --release --example cva_scaling
+```
+
+`examples/cva_scaling.rs` computes the CVA of a book of netting sets, with
+every set's CVA, Delta, Rho, N bucket vegas, and K hazard-rate
+sensitivities, both ways:
+
+- the adjoint pricer (`monte_carlo_cva`), which records each path once and
+  sweeps it once per netting set;
+- `bump_and_reval_cva`, which takes central differences of the tape-free
+  CVA, with every revaluation re-seeded onto the same paths. That costs
+  2(N + K) + 5 revaluations of the whole book.
+
+Setup:
+- **Market.** S = 100, r = 5%, a flat 20% vol split into N buckets over 5
+  years, and 20 quarterly exposure dates.
+- **Book.** Each netting set holds 10 European options (calls and puts,
+  strikes 80 to 120, maturities 1 to 5 years, long and short), with its own
+  hazard rate between 1% and 3% and recovery 40%. Set s is the same in every
+  book, so a larger book only adds sets.
+- **Protocol.** 2,000 paths, seed 42. Each point gets one discarded warm-up,
+  then five timed rounds of valuation, AAD, and bump-and-reval back to back.
+  The table gives the median and [min, max].
+
+The last column is the largest gap between an adjoint sensitivity and its
+bump-and-reval value, in adjoint standard errors, over every set. A set's
+sensitivity to another set's hazard rate must be exactly zero in both.
+Measured on 2026-10-26 on the same Apple M4.
+
+The path count is 2,000 rather than 10,000 because of the bump side. One
+valuation of the 10-set book takes 3.1 s at 10,000 paths. At that size,
+bump-and-reval at N = 50 would take about 6.5 minutes per run. Both methods
+are linear in the path count, so the ratios do not depend on it. A
+10,000-path run of the 10-set, 10-bucket book gave AAD / valuation 1.77,
+against 1.83 here.
+
+**Vol buckets N, with K = 10 netting sets:**
+
+| N | sens. per set x sets | valuations | valuation ms | AAD ms (median [min, max]) | bump ms (median [min, max]) | AAD / bump | AAD / valuation | bump / valuation | total CVA | max gap (SE) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 13 x 10 | 27 | 635 | 1141 [1101, 1196] | 17301 [16924, 17679] | 0.066 | 1.80 | 27.3 | 18.8988 | 0.007 |
+| 5 | 17 x 10 | 35 | 639 | 1154 [1148, 1227] | 23404 [22726, 23464] | 0.049 | 1.80 | 36.6 | 18.8988 | 0.007 |
+| 10 | 22 x 10 | 45 | 640 | 1152 [1146, 1162] | 28847 [28782, 29079] | 0.040 | 1.80 | 45.1 | 18.8988 | 0.007 |
+| 25 | 37 x 10 | 75 | 620 | 1157 [1153, 1163] | 46432 [46069, 46580] | 0.025 | 1.87 | 74.9 | 18.8167 | 0.008 |
+| 50 | 62 x 10 | 125 | 603 | 1170 [1163, 1195] | 75947 [75247, 77324] | 0.015 | 1.94 | 125.9 | 18.4905 | 0.008 |
+
+**Netting sets K, with N = 10 vol buckets:**
+
+| K | sens. per set x sets | valuations | valuation ms | AAD ms (median [min, max]) | bump ms (median [min, max]) | AAD / bump | AAD / valuation | bump / valuation | total CVA | max gap (SE) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 13 x 1 | 27 | 67 | 111 [109, 111] | 1782 [1772, 1786] | 0.062 | 1.66 | 26.7 | 1.2923 | 0.000 |
+| 2 | 14 x 2 | 29 | 124 | 208 [207, 210] | 3614 [3574, 3719] | 0.058 | 1.68 | 29.2 | 1.9786 | 0.002 |
+| 5 | 17 x 5 | 35 | 304 | 538 [534, 547] | 10756 [10664, 10775] | 0.050 | 1.77 | 35.3 | 6.8629 | 0.007 |
+| 10 | 22 x 10 | 45 | 613 | 1122 [1113, 1137] | 28012 [27760, 29318] | 0.040 | 1.83 | 45.7 | 18.8988 | 0.007 |
+| 20 | 32 x 20 | 65 | 1208 | 2427 [2408, 2449] | 79230 [78778, 80411] | 0.031 | 2.01 | 65.6 | 38.2908 | 0.009 |
+
+What the numbers say:
+
+- **Adding vol buckets barely moves AAD.**
+  - AAD went from 1141 to 1170 ms (1.80 to 1.94 valuations) as each set's
+    sensitivities grew from 13 to 62 (130 to 620 across the book).
+  - Bump-and-reval went from 17.3 s to 75.9 s, or 27.3 to 125.9 valuations,
+    against 2(N + K) + 5 = 27 to 125.
+  - At N = 50, AAD returns 620 sensitivities 65x faster than bump-and-reval
+    (AAD / bump 0.015).
+- **Adding netting sets costs both methods, but not equally.**
+  - One valuation is linear in K, about 60 ms per set (67 ms at K = 1,
+    1208 ms at K = 20).
+  - Bump-and-reval needs 2(N + K) + 5 of those valuations, so it grows
+    quadratically: 1.8 s at K = 1 and 79.2 s at K = 20.
+  - AAD sweeps once per set over a tape that also grows with K, so it has a
+    quadratic term too. Here that term is small: AAD went from 1.66 to 2.01
+    valuations between K = 1 and K = 20 (111 ms to 2427 ms). Before
+    measuring, I expected both methods to grow roughly as K^2; for AAD at
+    this size, that was wrong.
+  - Each backward sweep is two multiply-adds per tape node, while the
+    forward pass pays for two normal CDFs per trade per date. That
+    explanation is not separately measured.
+  - The AAD advantage still widens with K: AAD / bump is 0.062 at K = 1 and
+    0.031 at K = 20.
+- **Path simulation is a negligible share of the cost.** At N = 25 and 50
+  the grid has 40 and 60 steps instead of 20, yet a valuation took slightly
+  less time (620 and 603 ms against 640 ms). The cost is the Black-Scholes
+  future values. Those two rows also have a different total CVA, because a
+  finer grid draws different normals.
+- **Both methods compute the same sensitivities.** The largest gap is
+  0.009 adjoint standard errors, at every point, over every set's Delta,
+  Rho, vegas, and hazard-rate sensitivities. The cross-set hazard
+  sensitivities are exactly zero in both.
+- **Run conditions.**
+  - The whole run took 33 minutes. Within a point, the five timed rounds
+    spread by at most 8.6% (AAD at N = 1, [1101, 1196] ms).
+  - For about 14 seconds during the N = 50 point, a second copy of the
+    benchmark started by mistake ran alongside it and was stopped. Its bump
+    rounds stayed within 2.8% of each other ([75247, 77324] ms).
+  - There is no second full run: the run takes 33 minutes.
 
 ### Python call latency
 
