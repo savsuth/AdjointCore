@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">AdjointCore: every Greek from one backward sweep</title>
+  <desc id="desc">Reverse-mode AAD engine in Rust. Measured chart: the cost of one run in plain valuations as the number of sensitivities grows from 3 to 102. Bump-and-reval climbs from 7 to 207 valuations; AAD stays between 2.8 and 4.8, which makes it 43 times faster at 102 Greeks.</desc>
+
+  <rect width="1200" height="440" rx="24" fill="#0F1115"/>
+
+  <g id="title-block" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="64" y="92" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" letter-spacing="2" fill="#98A1AD">REVERSE-MODE AAD / RUST / MONTE CARLO</text>
+    <text x="64" y="168" font-size="72" font-weight="700" fill="#F2EEE6">AdjointCore</text>
+    <text x="64" y="218" font-size="28" font-weight="600" fill="#F2EEE6">Every Greek from one backward sweep.</text>
+    <text x="64" y="256" font-size="22" fill="#98A1AD">Tape, dual numbers and normal CDF,</text>
+    <text x="64" y="286" font-size="22" fill="#98A1AD">all written from scratch.</text>
+  </g>
+
+  <g id="tape-motif" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18">
+    <rect x="64" y="318" width="36" height="36" rx="6" fill="none" stroke="#F0A63A" stroke-width="2"/>
+    <text x="82" y="342" text-anchor="middle" fill="#F0A63A">S</text>
+    <rect x="112" y="318" width="36" height="36" rx="6" fill="none" stroke="#F0A63A" stroke-width="2"/>
+    <text x="130" y="342" text-anchor="middle" fill="#F0A63A">r</text>
+    <rect x="160" y="318" width="36" height="36" rx="6" fill="none" stroke="#F0A63A" stroke-width="2"/>
+    <text x="178" y="342" text-anchor="middle" fill="#F0A63A">σ</text>
+    <rect x="208" y="318" width="36" height="36" rx="6" fill="none" stroke="#5B6472" stroke-width="2"/>
+    <rect x="256" y="318" width="36" height="36" rx="6" fill="none" stroke="#5B6472" stroke-width="2"/>
+    <rect x="304" y="318" width="36" height="36" rx="6" fill="none" stroke="#5B6472" stroke-width="2"/>
+    <rect x="352" y="318" width="36" height="36" rx="6" fill="none" stroke="#5B6472" stroke-width="2"/>
+    <rect x="400" y="318" width="36" height="36" rx="6" fill="#F2EEE6"/>
+    <text x="418" y="342" text-anchor="middle" fill="#0F1115">V</text>
+    <path d="M418 368 V384 H82 V372" fill="none" stroke="#F0A63A" stroke-width="3"/>
+    <path d="M74 376 L82 364 L90 376 Z" fill="#F0A63A"/>
+    <text x="64" y="414" fill="#F0A63A">one backward sweep, every Greek</text>
+  </g>
+
+  <g id="proof-chart" font-family="ui-monospace, SFMono-Regular, Menlo, monospace">
+    <rect x="620" y="40" width="532" height="360" rx="18" fill="#161A22"/>
+    <text x="652" y="82" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="22" font-weight="600" fill="#F2EEE6">Cost of one run, in plain valuations</text>
+
+    <line x1="700" y1="230.5" x2="1100" y2="230.5" stroke="#2B313C" stroke-width="1"/>
+    <line x1="700" y1="121" x2="1100" y2="121" stroke="#2B313C" stroke-width="1"/>
+    <line x1="700" y1="340" x2="1100" y2="340" stroke="#5B6472" stroke-width="1.5"/>
+    <text x="688" y="346" font-size="18" text-anchor="end" fill="#98A1AD">0</text>
+    <text x="688" y="236" font-size="18" text-anchor="end" fill="#98A1AD">100</text>
+    <text x="688" y="127" font-size="18" text-anchor="end" fill="#98A1AD">200</text>
+    <text x="700" y="366" font-size="18" text-anchor="middle" fill="#98A1AD">0</text>
+    <text x="890.5" y="366" font-size="18" text-anchor="middle" fill="#98A1AD">50</text>
+    <text x="1081" y="366" font-size="18" text-anchor="middle" fill="#98A1AD">100</text>
+    <text x="900" y="390" font-size="18" text-anchor="middle" fill="#98A1AD">sensitivities returned</text>
+
+    <polyline points="711.4,332.3 715.2,329.9 726.7,323.5 745.7,312.6 802.9,278.8 898.1,225.6 1088.6,113.2" fill="none" stroke="#C8CDD4" stroke-width="3" stroke-dasharray="8 6"/>
+    <polyline points="711.4,336.9 715.2,336.9 726.7,336.8 745.7,336.7 802.9,336.3 898.1,335.9 1088.6,334.7" fill="none" stroke="#F0A63A" stroke-width="4"/>
+    <circle cx="1088.6" cy="113.2" r="5" fill="#C8CDD4"/>
+    <circle cx="1088.6" cy="334.7" r="5" fill="#F0A63A"/>
+
+    <text x="1076" y="104" font-size="20" text-anchor="end" fill="#C8CDD4">bump-and-reval: 207</text>
+    <text x="1076" y="322" font-size="20" font-weight="700" text-anchor="end" fill="#F0A63A">AAD: 4.8</text>
+    <text x="716" y="150" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="32" font-weight="700" fill="#F0A63A">43x faster</text>
+    <text x="716" y="176" font-size="18" fill="#98A1AD">at 102 Greeks</text>
+  </g>
+
+  <text x="1152" y="426" text-anchor="end" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="16" fill="#98A1AD">measured: examples/scaling.rs, Asian call, 10k paths, M4</text>
+</svg>

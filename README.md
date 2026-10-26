@@ -1,219 +1,105 @@
-# AdjointCore
+<p align="center">
+  <img src="./assets/readme/hero.svg" width="100%" alt="AdjointCore: every Greek from one backward sweep. Measured chart: at 102 sensitivities, bump-and-reval costs 207 valuations and AAD costs 4.8, 43x faster.">
+</p>
 
-AdjointCore is a reverse-mode Adjoint Algorithmic Differentiation (AAD)
-engine, implemented from first principles in Rust. It prices European calls,
-European puts, arithmetic-average Asian calls, and smoothed digital and
-up-and-out barrier calls by Monte Carlo simulation and, within the same
-computation, recovers their Greeks (Delta, Rho, and
-one Vega per bucket of a piecewise-constant volatility curve) from a single
-backward sweep per simulated path. It also computes the unilateral CVA of
-netting sets of European options, with every set's Delta, Rho, bucket
-vegas, and hazard-rate sensitivities from one recording per path. Paths run
-in parallel across threads with results that do not depend on the thread
-count. The engine is exposed
-to Python through PyO3 and `maturin` (currently the European call),
-allowing it to be imported and called like any standard Python package once
-built.
+AdjointCore prices options by Monte Carlo and gets all of their Greeks from
+one backward pass over each simulated path. That is reverse-mode adjoint
+algorithmic differentiation (AAD), written from scratch in Rust: the tape,
+the dual numbers, every operator, and the normal CDF. No autodiff crate.
 
-No external autodiff crate is used anywhere in this project. The tape, the
-Dual number, every operator overload, and the mathematical special
-functions are all implemented in this repository.
+**Jump to:** [Results](#results-at-a-glance) ·
+[How it works](#how-it-works) · [Getting started](#getting-started) ·
+[Usage](#usage) · [Full results](#full-results) ·
+[Limits](#where-it-stops-working) · [Tests](#running-the-tests)
 
-## Architecture
+## The 30-second version
 
-- **Tape (`src/tape.rs`)**: A thread-local, arena-backed log of operations.
-  Each `Node` stores up to two parent indices along with their local
-  partial derivatives, packed into `u32`/`f64` fields rather than `usize`.
-  This reduces the array scanned during the backward sweep by roughly 25%.
-  The arena itself is a `bumpalo::Bump`, leaked to `'static` once per
-  thread so the tape's `BumpVec` can borrow it without requiring a
-  self-referential struct.
+- **The usual way to get Greeks is to bump each input and reprice.** For 100
+  vol buckets that means 205 full Monte Carlo runs.
+- **AAD records each path once and sweeps it backward once.** Every
+  sensitivity falls out of that one sweep, so 102 Greeks cost about what 3
+  do.
+- **Both methods are in this repo**, on the same paths, so every speedup
+  below is checked against the slow way and they agree.
 
-- **Pathwise differentiation**: Paths are differentiated pathwise
-  (∇E[V] = E[∇V]). Each path records its own forward pass, performs its
-  backward sweep, and is reset before the next path begins. This reset
-  operation calls `nodes.clear()` rather than `Bump::reset()`, which
-  preserves the vector's already-grown capacity instead of releasing it.
-  As a result, from the second path onward, the forward pass performs zero
-  heap allocations.
+## Results at a glance
 
-- **Dual number (`src/dual.rs`)**: A 16-byte `Copy` handle formatted as
-  `{ value: f64, index: u32, generation: u32 }`, which holds no derivative
-  data of its own — every partial resides on the tape. The `Gradient`
-  struct reads directly from the tape's adjoint buffer rather than
-  returning a copy, ensuring `.backward()` performs no allocations.
+Everything here was measured on an Apple M4, with the command shown. The
+full tables are under [Full results](#full-results).
 
-- **Handle validity**: A `Dual` is valid only on the tape recording it came
-  from (same thread, no `tape::reset()` since), and a `Gradient` only until
-  the next `backward()` or reset on that thread. Each recording gets a
-  process-wide unique generation id, and any use outside that window
-  panics with a "stale" message instead of silently reading whatever node
-  now occupies the same index. Previously this window was documented for
-  `Gradient` but not enforced; the pricer and the existing tests already
-  stayed inside it, so their results are unchanged. The cost is one relaxed atomic add per reset and an
-  integer compare per recorded operation, sweep, and `wrt` call. The
-  generation counter is a `u32` so `Dual` stays 16 bytes; it wraps after
-  2^32 resets, so a handle reused exactly that many generations later
-  would not be caught.
+| What | Result | Command |
+|---|---|---|
+| 102 Greeks of an Asian option | **43x faster** than bump-and-reval (73.6 ms vs 3151.1 ms) | `cargo run --release --example scaling` |
+| CVA of 10 netting sets, 620 sensitivities | **65x faster** (1.17 s vs 75.9 s) | `cargo run --release --example cva_scaling` |
+| Do the two methods agree? | Yes, every gap is within **0.03 standard errors** | both of the above |
+| 10 threads | **7.07x** speedup, bit-identical results at any thread count | `cargo run --release --example parallel` |
+| Control variate on an Asian | price variance cut **186x to 808x** | `cargo run --release --example variance_reduction` |
+| Pathwise Greeks of a barrier, unsmoothed | **wrong sign**: Delta +0.247 against a true -0.008, fixed by smoothing | `cargo run --release --example smoothing` |
+| Test suite | **83 tests**, green on Linux CI | `cargo test --release` |
 
-- **Operators (`src/ops.rs`)**: `Add`, `Sub`, `Mul`, and `Div` are
-  implemented across all three relevant operand shapes (`Dual op Dual`,
-  `Dual op f64`, `f64 op Dual`), plus unary `Neg`. The engine also supports `exp`, `sqrt`,
-  `ln`, `norm_cdf`, `max_zero` (the option payoff kink, whose
-  subgradient is taken as 0 exactly at the kink itself), and `step`
-  (the indicator 1{x > 0}, recorded with a zero partial, which is all a
-  pathwise sweep can see of a jump).
+## About
 
-- **Normal CDF (`src/special.rs`)**: The rational approximation commonly
-  used across quantitative finance libraries is often described as double
-  precision. Measured against 60-digit references, its accuracy turns out
-  to be a little more modest than that label suggests — its tail alone
-  carries an error of approximately 8.7e-9 near |x| = 8. This
-  implementation takes a different approach, splitting the domain at
-  |x| = 1.5. An all-positive-term `erf` series is used below that
-  threshold, and a Mills-ratio continued fraction (evaluated by modified
-  Lentz and run to full convergence rather than truncated early) is used
-  above it. Measured against the same 60-digit references, the worst-case
-  error is 2.6e-15, approximately six orders of magnitude tighter than the
-  approximation it replaces.
+AdjointCore is a portfolio project for quant pricing and risk work. It is
+small enough to read in an afternoon and complete enough to measure.
 
-- **Payoffs (`src/payoff.rs`)**: A `Payoff` trait gives the number of
-  equally spaced fixing dates and the undiscounted payoff on the spot at
-  those dates. It is implemented by `EuropeanCall`, `EuropeanPut`,
-  `AsianCall` (arithmetic average over the fixings, today's spot excluded),
-  and the smoothed `DigitalCall` and `UpAndOutCall` (see
-  [Smoothed digital and barrier](#smoothed-digital-and-barrier)).
-  Payoffs are written once against a small `Real` scalar trait implemented
-  for both `Dual` and `f64`. On `Dual` every step is recorded for the
-  adjoint sweep. On `f64` nothing is recorded, which gives a tape-free
-  revaluation (`monte_carlo_value`) that sees exactly the same paths for the
-  same seed. That revaluation is the bump-and-reval oracle.
+It prices:
 
-- **Monte Carlo pricer (`src/pricer.rs`)**: An Euler-Maruyama simulation of
-  geometric Brownian motion, applied to ln S, so each step between fixing
-  dates is the exact log-normal transition with no discretization bias.
-  `monte_carlo_greeks` is generic over the payoff. Spot, Rate, and
-  Volatility are recorded as tape variables, allowing Delta, Rho, and Vega
-  to be recovered from the same sweep that produces the price. Time and the
-  payoff's own terms (strike, fixings) remain plain constants, since no
-  Greek is required with respect to them. The
-  standard error of each output quantity is tracked with a streaming
-  accumulator (Welford's algorithm). The test suite verifies agreement
-  with closed-form Black-Scholes to within five standard errors per
-  quantity — a statistically grounded tolerance, rather than one fixed
-  bound applied uniformly to all four estimators of differing variance.
+- **Vanilla options:** European calls and puts.
+- **Path-dependent options:** arithmetic-average Asian calls.
+- **Discontinuous payoffs:** digital calls and discretely monitored
+  up-and-out calls, both smoothed so their Greeks make sense.
+- **Counterparty risk:** unilateral CVA of netting sets of European options.
 
-- **Volatility curve (`src/pricer.rs`)**: `monte_carlo_greeks_bucketed`
-  takes a piecewise-constant volatility curve, with N equal buckets over
-  [0, T]. Every bucket volatility is its own tape variable, so one backward
-  sweep per path returns the price, Delta, Rho, and all N bucket vegas. The
-  simulation grid merges the payoff's fixing dates with the bucket edges
-  using exact integer arithmetic (both are integer multiples of T / (nN)),
-  so every step lies inside one bucket and stays an exact log-normal
-  transition. With one bucket the grid and arithmetic are those of the flat
-  pricer, and the results are bit-identical. The flat `monte_carlo_greeks`
-  is now that one-bucket case.
+Each price comes back with Delta, Rho, and one vega per bucket of a
+piecewise-constant vol curve. For CVA it also returns each counterparty's
+hazard-rate sensitivity. Every Monte Carlo number comes with its own
+standard error.
 
-- **Parallel paths (`src/pricer.rs`)**: `monte_carlo_greeks_parallel`
-  splits the paths into fixed-size chunks and prices them on the current
-  rayon thread pool. The chunks are described by `PathChunks { seed,
-  chunk_size }`. Each chunk draws from its own `StdRng` (ChaCha12), keyed by
-  the seed and the chunk index, so no two chunks share a stream. Each chunk
-  records on the thread-local tape of whichever worker runs it, so no tape
-  is ever shared. Each chunk keeps its own Welford accumulators. These are
-  merged in chunk order with the pairwise formula of Chan, Golub, and
-  LeVeque, which combines means weighted by count and corrects the squared
-  deviations for the gap between the means. Which paths exist, and the order
-  their statistics combine in, depend only on the seed, the chunk size, and
-  the path count, so the result is bit-identical on any number of threads.
+## How it works
 
-- **Variance reduction (`src/variance.rs`)**: `monte_carlo_greeks_reduced`
-  takes a `VarianceReduction { antithetic, control_variate }`. Both
-  reductions apply to the price and to every Greek.
-  - **Antithetic.** Each path is paired with its mirror, every normal
-    negated. Both legs are recorded on one tape and their average is swept
-    once, so a pair costs one backward sweep.
-  - **Control variate.** The geometric-average Asian call on the same path
-    (Kemna and Vorst), with coefficient 1. Its expectation has a closed form
-    even on the piecewise-constant volatility curve, because ln G is normal
-    with a mean and variance that accumulate along the same merged grid.
-  - **The closed form is on the tape.** `geometric_asian_call` writes it in
-    `Dual` arithmetic and records it once, so one sweep gives its exact
-    Greeks. The controlled estimator samples payoff minus control along the
-    paths and adds those exact Greeks back.
-  - **Why a fixed coefficient.** It keeps the estimator unbiased for the
-    price and every Greek. An estimated optimal coefficient would add an
-    O(1/n) bias.
+1. **Record.** Spot, rate, and every bucket vol go on a tape. Simulating a
+   path appends one node per operation, each storing the local derivative of
+   that one step.
+2. **Sweep.** One backward pass from the discounted payoff multiplies those
+   local derivatives together. When it reaches the inputs, each input's
+   adjoint is its Greek.
+3. **Reset.** The tape is cleared for the next path but keeps the memory it
+   grew, so later paths reuse it.
+4. **Check.** Bump-and-reval runs on exactly the same paths, from the same
+   seed, as an independent check.
 
-- **Bump-and-reval (`src/bump.rs`)**: The baseline the adjoint pricer is
-  measured against, with no adjoint code involved. It takes central
-  differences of the tape-free pricer, re-seeding every revaluation so all
-  of them see the same paths, which costs 2N + 5 valuations for N vol
-  buckets.
+One caveat matters for the maths: the pathwise derivative is only unbiased
+when the payoff is continuous in the path. More on that in
+[Where it stops working](#where-it-stops-working).
 
-- **Netting-set CVA (`src/xva.rs`)**: `monte_carlo_cva` takes netting sets of
-  European calls and puts with signed notionals. Each set faces one
-  counterparty with a flat hazard rate and a recovery rate. On exposure dates
-  t_j = jT/m, the CVA is
-  (1 - R) sum_j E[D(t_j) max(V(t_j), 0)] (e^{-lambda t_{j-1}} - e^{-lambda t_j}),
-  where V is the netted value of the trades still alive. Netting makes this
-  nonlinear, because max(sum v_i, 0) <= sum max(v_i, 0).
-  - **Future values.** Each trade's value at an exposure date is the
-    Black-Scholes closed form on the variance remaining on the bucket curve.
-    That is exact for piecewise-constant volatility, and it is written once
-    against `Real`.
-  - **Inputs on the tape.** Spot, rate, every bucket vol, and every set's
-    hazard rate are tape variables. They reach the CVA through the simulated
-    spot, the future values, the discount factors, and the default
-    probabilities.
-  - **One sweep per netting set.** Each path is recorded once and swept once
-    per set, which gives each set's CVA, Delta, Rho, bucket vegas, and
-    hazard-rate sensitivities, plus its expected exposure profile. The
-    exposure max(V, 0) is Lipschitz in the path, so the pathwise estimator
-    is unbiased.
-  - **Oracle.** `cva_value` is the tape-free revaluation on the same paths.
-    `bump_and_reval_cva` takes central differences of it at a cost of
-    2(N + K) + 5 valuations for N buckets and K sets.
+## Getting started
 
-- **PyO3 bridge (`src/python.rs`)**: `mc_pricer` returns
-  `{"price", "delta", "vega", "rho"}` for a European Call under a flat
-  volatility. `mc_pricer_buckets` takes a list of bucket volatilities and
-  returns `{"price", "delta", "rho", "vegas"}`, with `vegas` holding one
-  sensitivity per bucket. Once built, the engine is accessible via
-  `import adjoint_core`.
+### Prerequisites
 
-## Where the pathwise estimator stops working
+- Rust stable (built and tested with rustc 1.97.1)
+- Python 3.9 or newer, plus `maturin`, only if you want the Python bindings
 
-Every Greek here is a pathwise estimator: the derivative of each simulated
-path's discounted payoff, averaged over paths. It is unbiased only when the
-payoff is continuous in the path (Lipschitz is enough), so that
-differentiating inside the expectation is allowed. Calls, puts, and
-arithmetic Asians qualify. Their kink at the strike has zero probability
-under a continuous distribution and contributes nothing.
+### Build and test
 
-Discontinuous payoffs such as digitals and barriers do not qualify. Their
-pathwise derivative is zero on almost every path, because a small bump does
-not change which side of the strike or barrier a path lands on. Yet the true
-sensitivity comes entirely from the jump. The pathwise estimate would
-therefore be a confident, wrong zero (or a value missing the jump's
-contribution). The engine offers these payoffs only with the jump smoothed
-into a call spread of width h, which makes the pathwise estimator unbiased
-for the smoothed payoff at the cost of an O(h^2) bias against the true one;
-[Smoothed digital and barrier](#smoothed-digital-and-barrier) measures that
-bias. The likelihood-ratio method and a conditional expectation step are
-the unbiased alternatives; this engine does not offer them.
+```bash
+git clone https://github.com/savsuth/AdjointCore.git
+cd AdjointCore
+cargo test --release
+```
 
-## Continuous integration
+That runs all 83 tests. It took 36.5 s on the M4.
 
-`.github/workflows/ci.yml` runs on every push and pull request, on
-`ubuntu-latest`. It runs two jobs:
+### Run a benchmark
 
-- `cargo test --release`;
-- a maturin build check: build the wheel, install it, and import it.
+```bash
+cargo run --release --example scaling
+```
 
-There is no deploy step.
+The others are `parallel`, `variance_reduction`, `smoothing`, and
+`cva_scaling`. Heads up: `smoothing` takes about a minute and `cva_scaling`
+about 33 minutes.
 
-## Building
+### Python
 
 ```bash
 python3 -m venv .venv
@@ -223,100 +109,79 @@ maturin develop --release
 python main.py
 ```
 
-## Testing
+`main.py` prices Hull's textbook call (S = 42, K = 40, r = 10%, vol = 20%,
+T = 0.5). The Python side is narrower than the Rust side; see
+[Limits](#where-it-stops-working).
 
-```bash
-cargo test --release
+## Usage
+
+The crate isn't on crates.io, so depend on it from git:
+
+```toml
+[dependencies]
+adjoint-core = { git = "https://github.com/savsuth/AdjointCore" }
+rand = "0.8"
 ```
 
-The suite comprises 83 tests: one unit test of the accumulator merge and 82
-integration tests across twelve modules. They cover the tape's accumulation
-and reset behavior, the normal CDF kernel verified against independently
-generated reference values, every operator and math function verified
-against its analytical derivative, the Monte Carlo engine verified
-against closed-form Black-Scholes with an additional cross-seed consistency
-check, handle validity (stale `Dual` and `Gradient` use after a reset,
-a second sweep, or on another thread is rejected), and the payoffs:
-the put against closed-form Black-Scholes and put-call parity on common
-paths, and each Asian Greek against central-difference bump-and-reval with
-common random numbers. The volatility curve is checked as follows:
-- One bucket reproduces the flat pricer bit for bit.
-- With equal bucket volatilities, the bucket vegas sum to the flat Vega
-  exactly on common paths, and to the Black-Scholes Vega statistically.
-- On an unequal curve, the price, Delta, Rho, and each bucket vega match
-  Black-Scholes at the integrated-variance volatility.
-- Each bucket vega matches bump-and-reval on common random numbers.
-- An Asian whose fixings fall between bucket edges agrees with the flat
-  Asian.
+Price an Asian call on a five-bucket vol curve and get every Greek in one go:
 
-`bump_and_reval` is checked against the adjoint Greeks on the same seed,
-for a European and an Asian call on vol curves, and its price must equal the
-adjoint price exactly.
+```rust
+use adjoint_core::{AsianCall, monte_carlo_greeks_bucketed};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
-The parallel pricer must give bit-identical results on 1, 2, 4, and 8
-threads (20,500 paths, so the last chunk is partial). It must also match
-Black-Scholes at the integrated-variance volatility, and two chunk sizes must
-give statistically consistent estimates with matching standard errors. The
-merged accumulator must equal one sequential pass, including when either
-side is empty.
+fn main() {
+    // 12 monthly fixings, strike 100, on a one-year vol curve with five buckets.
+    let asian = AsianCall { strike: 100.0, fixings: 12 };
+    let vols = [0.18, 0.22, 0.20, 0.25, 0.15];
 
-The smoothed payoffs are checked as follows:
-- The digital closed form equals minus the strike derivative of the
-  Black-Scholes call, for the price and each Greek.
-- The smoothed digital's price and Greeks match the closed-form call spread
-  (C(K - h/2) - C(K + h/2)) / h at three strikes and two widths, so the
-  pathwise estimator is unbiased for the payoff it smooths.
-- The smoothing bias of the digital falls by a factor of 4 when h halves.
-- On the exact digital, the pathwise Delta and Vega have mean 0 and standard
-  error 0 (zero on every path), and Rho is -T times the price.
-- An unreachable exact barrier reproduces the European call bit for bit.
-- The smoothed barrier's Delta, Rho, and bucket vegas match bump-and-reval
-  of the same smoothed payoff on common random numbers.
+    let mut rng = StdRng::seed_from_u64(42);
+    let r = monte_carlo_greeks_bucketed(&asian, 100.0, 0.05, &vols, 1.0, 100_000, &mut rng);
 
-The netting-set CVA (`src/xva.rs`) is checked as follows:
-- Netting never raises CVA or expected exposure against the sum of the
-  trades' standalone values on common paths, and a fully offset set has CVA
-  and every sensitivity exactly zero.
-- A long-only set matches its closed form: its value is never negative, so
-  the expected discounted exposure at each date is today's value of the
-  trades still alive. CVA, Delta, Rho, each bucket vega, the hazard-rate
-  sensitivity, and the expected exposure profile are all checked.
-- With equal bucket vols, the bucket vegas sum to the flat Vega on common
-  paths.
-- A set's sensitivity to another counterparty's hazard rate is exactly zero,
-  and the total across sets is the sum of the sets.
-- The tape-free CVA reproduces the adjoint CVA bit for bit.
-- On mixed long and short sets, every sensitivity matches bump-and-reval on
-  common random numbers.
+    println!("price {:.4} (SE {:.4})", r.greeks.price, r.std_error.price);
+    println!("delta {:.4}  rho {:.4}", r.greeks.delta, r.greeks.rho);
+    println!("vegas {:.3?}", r.greeks.vegas);
+}
+```
 
-All Monte Carlo checks use a tolerance of five standard errors of the
-estimator under test.
+It prints:
 
-## Benchmarking
+```text
+price 6.1918 (SE 0.0271)
+delta 0.5951  rho 26.8641
+vegas [9.748, 7.568, 3.582, 1.859, 0.241]
+```
 
-### AAD against bump-and-reval as the sensitivity count grows
+Other entry points:
+
+- `monte_carlo_greeks_parallel` for many threads.
+- `monte_carlo_greeks_reduced` for antithetic sampling and the control
+  variate.
+- `monte_carlo_cva` for netting-set CVA.
+- `bump_and_reval` and `bump_and_reval_cva` for the slow way.
+
+## Full results
+
+Each section has the command, the setup, the full table, and what to take
+from it. Click to open.
+
+<details>
+<summary><b>AAD against bump-and-reval as the Greek count grows</b> (43x at 102 Greeks)</summary>
 
 ```bash
 cargo run --release --example scaling
 ```
 
-`examples/scaling.rs` prices an arithmetic Asian call (100 fixings, T = 1,
-S = K = 100, r = 5%, flat 20% vol split into N buckets) on 10,000 paths with
-seed 42. It returns N + 2 sensitivities (Delta, Rho, N bucket vegas) two
-ways:
-
-- the adjoint pricer, with one backward sweep per path;
-- `bump_and_reval` (`src/bump.rs`), with central differences of the
-  tape-free pricer. Every revaluation is re-seeded so all of them see the
-  same paths, which gives 2N + 5 valuations in all.
-
-Both methods use the same paths, seed, and 100-step grid. Every N divides
-100, so one valuation costs the same at every N. Each N gets one discarded
-warm-up round, then seven timed rounds, each running the three methods back
-to back. The table shows the median and [min, max] wall time.
-
-Measured on 2026-10-23: Apple M4, 10 cores, 16 GB, macOS (Darwin 24.1.0),
-rustc 1.97.1, single-threaded, release profile.
+**Setup**
+- Arithmetic Asian call: 100 fixings, T = 1, S = K = 100, r = 5%.
+- A flat 20% vol split into N buckets.
+- 10,000 paths, seed 42, single thread.
+- Every N divides 100, so the grid is the same 100 steps throughout, and one
+  valuation costs the same at every N.
+- Each N gets one warm-up round, then seven timed rounds; the table shows the
+  median and [min, max].
+- Measured 2026-10-23 on an Apple M4 (10 cores, 16 GB), macOS (Darwin
+  24.1.0), rustc 1.97.1.
 
 | N | sensitivities | valuation ms | AAD ms | bump ms | AAD / bump | AAD / valuation | bump / valuation | tape nodes / path | max gap (SE) |
 |---|---|---|---|---|---|---|---|---|---|
@@ -328,43 +193,39 @@ rustc 1.97.1, single-threaded, release profile.
 | 50 | 52 | 15.0 | 56.0 [55.9, 57.4] | 1563.2 [1556.2, 1583.6] | 0.036 | 3.75 | 104.5 | 806 | 0.027 |
 | 100 | 102 | 15.2 | 73.6 [73.6, 75.9] | 3151.1 [3142.9, 3193.1] | 0.023 | 4.84 | 207.1 | 1106 | 0.027 |
 
-What the numbers say:
+**What to take from it**
+- **Bump-and-reval grows just as predicted.** It needs 2N + 5 valuations.
+  Measured, that is 7.0 at N = 1 and 207.1 at N = 100, against 7 and 205.
+- **AAD grows a little, not a lot.** Going from 3 to 102 Greeks took it from
+  2.83 to 4.84 valuations' worth of time.
+- **The growth is the tape.** Each bucket adds exactly 6 nodes per path (512
+  to 1106), plus one adjoint read per extra vega. There is no step in the
+  timings that would suggest a cache cliff.
+- **Tape memory, derived not measured:** about 35 KB per path at 1106 nodes.
+- **Same answers.** The largest gap between any AAD Greek and its bump value
+  is 0.027 of the AAD standard error, at every N.
+- **Repeat runs.**
+  - A second run gave 73.5 ms (AAD) and 3214.1 ms (bump) at N = 100.
+  - An earlier run on a busier machine gave a bump median of 3625.1 ms, with
+    a max of 5555.7 ms.
+  - AAD stayed within about 1 ms across all three runs.
 
-- **Bump-and-reval scales with N, as theory predicts.** Its cost is
-  2N + 5 valuations. The measured ratio to one valuation is 7.0 at N = 1 and
-  207.1 at N = 100, against 7 and 205.
-- **AAD does not scale with N, but it is not perfectly flat either.** Going
-  from 3 to 102 sensitivities raised its cost from 2.83 to 4.84 valuations
-  (39.2 to 73.6 ms). The reason is the tape. Each bucket adds one input node
-  plus five nodes for its drift and diffusion terms, so the tape grows from
-  512 to 1106 nodes per path, exactly 6 per extra bucket. Each extra vega
-  also costs one adjoint lookup and one accumulator update per path. Time
-  grows smoothly with tape length, with no step that would point to a cache
-  effect. At 1106 nodes the tape and its adjoints are about 35 KB per path
-  (24-byte nodes plus 8-byte adjoints), a figure derived from the struct
-  sizes rather than measured.
-- **At N = 100, AAD returns 102 sensitivities 43x faster than
-  bump-and-reval** (73.6 ms against 3151.1 ms).
-- **Both methods compute the same Greeks.** The largest gap between any
-  adjoint Greek and its bump-and-reval value is 0.027 of the adjoint
-  estimator's standard error at every N.
-- **Run-to-run variation.** A second run of the same command gave an AAD
-  median of 73.5 ms and a bump median of 3214.1 ms at N = 100. An earlier
-  run, made before the tape column was added and with other load on the
-  machine, gave a bump median of 3625.1 ms with a max of 5555.7 ms. The AAD
-  column was stable within about 1 ms across all three runs.
+</details>
 
-### Parallel paths
+<details>
+<summary><b>Parallel paths</b> (7.07x on 10 threads, same answer every time)</summary>
 
 ```bash
 cargo run --release --example parallel
 ```
 
-`examples/parallel.rs` prices the same Asian call on a 100-bucket curve (102
-sensitivities) on 100,000 paths in chunks of 1,000, with seed 42. Each
-thread count runs on a dedicated rayon pool of that size, with one discarded
-warm-up and five timed runs. Measured on 2026-10-23 on the same Apple M4,
-which has 4 performance and 6 efficiency cores:
+**Setup**
+- The same Asian call on a 100-bucket curve (102 sensitivities).
+- 100,000 paths in chunks of 1,000, seed 42.
+- Each thread count gets its own rayon pool, one warm-up, and five timed
+  runs.
+- Measured 2026-10-23 on the M4, which has 4 performance and 6 efficiency
+  cores.
 
 | threads | AAD ms (median [min, max]) | speedup vs 1 thread | identical to 1 thread |
 |---|---|---|---|
@@ -374,27 +235,39 @@ which has 4 performance and 6 efficiency cores:
 | 8 | 119.2 [118.3, 138.5] | 6.35 | true |
 | 10 | 107.1 [100.3, 131.4] | 7.07 | true |
 
-The serial pricer, with no chunks and no pool, took 758.2 ms
-[757.9, 758.4], so chunking costs nothing measurable. Scaling is close to
-linear up to 4 threads. Beyond that, the extra threads land on efficiency
-cores, which are slower, so 10 threads give 7.07x rather than 10x. A second
-run gave 1.97x, 3.73x, 6.35x, and 7.09x at 2, 4, 8, and 10 threads. Every
-parallel result was bit-identical to the one-thread result.
+**What to take from it**
+- **Chunking is free.** The serial pricer took 758.2 ms [757.9, 758.4].
+- **Scaling is near-linear up to 4 threads.** After that the extra threads
+  land on the slower efficiency cores, so 10 threads give 7.07x, not 10x.
+- **Repeat run:** 1.97x, 3.73x, 6.35x, and 7.09x at 2, 4, 8, and 10 threads.
+- **Bit-identical at any thread count.** Each chunk has its own random
+  stream, keyed by the seed and the chunk index. Results are merged in chunk
+  order, so the thread count never changes the answer.
 
-### Variance reduction
+</details>
+
+<details>
+<summary><b>Variance reduction</b> (control variate: 186x to 808x on the price)</summary>
 
 ```bash
 cargo run --release --example variance_reduction
 ```
 
-`examples/variance_reduction.rs` prices a 12-fixing arithmetic Asian call
-(S = 100, r = 5%, T = 1, 5-bucket vol curve 18/22/20/25/15%) at three
-strikes. Every method uses 100,000 simulated paths from seed 42 (antithetic:
-50,000 pairs). VR is the variance reduction factor, (plain SE / method SE)^2:
-how many times more plain paths the same standard error would need. The
-vegas column gives the smallest and largest VR across the five buckets. Time
-is the median of five runs. Efficiency is the price VR times
-(plain time / method time). Measured on 2026-10-24 on the same Apple M4.
+**Setup**
+- 12-fixing arithmetic Asian call, S = 100, r = 5%, T = 1.
+- 5-bucket vol curve: 18, 22, 20, 25, 15%. Three strikes.
+- 100,000 simulated paths from seed 42 for every method (antithetic: 50,000
+  pairs).
+
+**How to read the table**
+- **VR** is (plain SE / method SE)^2: how many times more plain paths you
+  would need for the same error.
+- The vegas column gives the smallest and largest VR across the five
+  buckets.
+- Time is the median of five runs.
+- Efficiency is the price VR times (plain time / method time).
+
+Measured 2026-10-24 on the M4.
 
 | K | method | price | price SE | VR price | VR delta | VR rho | VR vegas [min, max] | ms | efficiency |
 |---|---|---|---|---|---|---|---|---|---|
@@ -411,70 +284,64 @@ is the median of five runs. Efficiency is the price VR times
 | 110 | control | 2.3057 | 0.00126 | 186.2 | 28.5 | 20.9 | [18.4, 56.8] | 124.3 | 156.5 |
 | 110 | both | 2.3042 | 0.00114 | 228.3 | 28.3 | 21.3 | [18.6, 60.8] | 126.8 | 188.3 |
 
-What the numbers say:
+**What to take from it**
+- **The control variate does nearly all the work.**
+  - The control is the geometric-average Asian, with coefficient 1. It has a
+    closed form, recorded on the tape, so its Greeks are exact too.
+  - It cuts price variance 186x to 808x, Delta and Rho 15x to 41x, and the
+    bucket vegas 18x to 203x.
+  - It costs 7% to 39% more time, so per unit of compute it is worth 157x to
+    757x on the price.
+- **It works best in the money.** There both averages sit above the strike
+  and move together. Out of the money, the kinks of the two averages fall in
+  different places.
+- **Antithetic sampling is weak here and can hurt.**
+  - It gives 1.2x to 7.4x on the price.
+  - On the K = 90 Rho it is slightly worse than plain (0.9). Mirroring the
+    normals only helps something that moves roughly monotonically with them.
+- **Using both mostly helps the price.** That is up to 1.45x on top of the
+  control alone.
+- **Correctness checks.**
+  - All four methods agree within their combined standard errors.
+  - With one fixing, the control is the European call itself, and the
+    controlled estimator returns Black-Scholes with an SE below 1e-10.
+- **Repeat run:** identical VR columns. Times moved by up to 32 ms; the worst
+  was K = 100 control, 194.9 ms against 162.9 ms.
 
-- **The control variate does almost all the work.** It cuts the price
-  variance 186x to 808x, Delta and Rho variance 15x to 41x, and bucket-vega
-  variance 18x to 203x. Its extra cost is 7% to 39% more time, from one
-  logarithm per fixing on the tape plus the subtraction, so per unit of
-  compute it is worth 157x to 757x on the price.
-- **The reduction depends on the strike.** It is largest in the money,
-  where both averages are almost always above the strike and their payoffs
-  move together nearly linearly. It is smallest out of the money, where the
-  kink sits in a different place for the arithmetic and the geometric
-  average.
-- **Antithetic sampling is weak on its own, and can hurt.** It reduces price
-  variance 1.2x to 7.4x, and less out of the money, where both legs of most
-  pairs pay zero. On the K = 90 Rho it is slightly worse than plain
-  (VR 0.9): mirroring only helps a quantity that moves roughly monotonically
-  with the normals, which that pathwise estimator does not.
-- **Combining the two mostly helps the price.** The combination adds up to
-  1.45x on the price over the control alone, and leaves the Greeks about
-  where the control put them.
-- **Correctness.** All four methods' Greeks agree with each other within
-  their combined standard errors (`tests/variance_reduction.rs`). With one
-  fixing, the control is the European call itself, so the controlled
-  estimator returns Black-Scholes with a standard error below 1e-10.
-- **Repeatability.** A second run gave identical VR columns (fixed seed).
-  Times differed by up to 32 ms per method; the largest gap was K = 100
-  control, 194.9 ms against 162.9 ms.
+</details>
 
-### Smoothed digital and barrier
+<details>
+<summary><b>Smoothed digital and barrier</b> (why raw pathwise Greeks fail, and what smoothing costs)</summary>
 
 ```bash
 cargo run --release --example smoothing
 ```
 
-`DigitalCall { strike, smoothing }` pays 1 if S_T > K. `UpAndOutCall {
-strike, barrier, fixings, smoothing }` is a call that is knocked out if the
-spot is at or above the barrier on any of its equally spaced fixing dates.
-Both replace each indicator with a centered call spread of width h:
-1{x > 0} becomes ((x + h/2)+ - (x - h/2)+) / h, a ramp from 0 to 1 across
-the band [-h/2, h/2]. The smoothed payoff is Lipschitz in the path, so the
-pathwise estimator is unbiased for it, and biased against the true payoff by
-the smoothing alone. With h = 0 the payoff is exact: its price is unbiased
-and its pathwise Greeks are not.
+**What smoothing does**
+- `DigitalCall` pays 1 if S_T > K. `UpAndOutCall` is a call that dies if the
+  spot is at or above the barrier on any fixing date.
+- Both replace each jump with a centered call spread of width h, a straight
+  ramp from 0 to 1 across [-h/2, h/2]. With h = 0 you get the exact payoff.
+- **Bias is O(h^2).** The ramp is symmetric, so the first-order error
+  cancels. A one-sided spread would give O(h).
+- **Variance is O(1/h).** Inside the band the slope is 1/h, so a pathwise
+  Greek's SE grows like 1/sqrt(h).
 
-- **Bias is O(h^2).** The ramp is the indicator averaged over shifts in
-  [-h/2, h/2]. That average is symmetric, so the first-order term cancels. A
-  one-sided spread, the conservative overhedge, would give O(h).
-- **Variance is O(1/h).** Inside the band the payoff's slope is 1/h, and a
-  path lands in the band with probability proportional to h. The variance of
-  a pathwise Greek therefore grows like 1/h, and its SE like 1/sqrt(h).
+**Setup**
+- S = K = 100, r = 5%, flat 20% vol, T = 1, seed 42.
+- Bias is the estimate minus the reference, and z is the bias over its SE.
+- Every row reuses the same paths, so read each column for its trend.
+- The whole example takes 57 s (measured 2026-10-24 on the M4).
 
-Setup: S = K = 100, r = 5%, flat 20% vol, T = 1, seed 42. A bias is the
-Monte Carlo estimate minus the reference, and z is the bias divided by its
-standard error. Every row of a table reuses the same paths, so the noise in
-a column is correlated down the rows: read a column for its trend. Measured
-on 2026-10-24 on the same Apple M4; the whole example takes 57 s.
+**Digital call, 1,000,000 paths**
 
-**Digital call, 1,000,000 paths.** The reference is the Black-Scholes
-cash-or-nothing closed form (`black_scholes_digital`), which is exact: price
-0.53232, Delta 0.01876, Vega -0.6567, Rho 1.3439. The smoothed payoff's own
-expectation is (C(K - h/2) - C(K + h/2)) / h, also closed form. Delta exact
-bias is therefore the smoothing bias with no noise in it, and Delta RMSE is
-sqrt(exact bias^2 + SE^2) at this path count. The last column is the
-largest |MC - call spread| / SE over the price and the three Greeks.
+The reference is the exact Black-Scholes digital: price 0.53232, Delta
+0.01876, Vega -0.6567, Rho 1.3439.
+- The smoothed payoff has its own exact value, (C(K - h/2) - C(K + h/2)) / h.
+  "Delta exact bias" is therefore pure smoothing bias, with no noise in it.
+- Delta RMSE is sqrt(bias^2 + SE^2).
+- The last column is the worst |MC - call spread| / SE across all four
+  outputs.
 
 | h | price bias (z) | Delta | Delta bias (z) | Delta SE | Delta exact bias | Delta RMSE | Vega bias (z) | Vega SE | Rho bias (z) | gap to spread (max abs z) |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -486,28 +353,27 @@ largest |MC - call spread| / SE over the price and the three Greeks.
 | 10 | -0.00017 (-0.4) | 0.01859 | -0.00017 (-4.6) | 0.00004 | -2.0e-4 | 0.00020 | +0.0076 (+5.3) | 0.0014 | -0.0172 (-4.5) | 0.89 |
 | 20 | +0.00042 (+1.0) | 0.01801 | -0.00075 (-32.4) | 0.00002 | -7.6e-4 | 0.00076 | +0.0345 (+31.1) | 0.0011 | -0.0754 (-31.6) | 1.35 |
 
-On the exact digital (h = 0), over 1,000,000 paths, the pathwise Delta and
-Vega have mean 0 and standard error 0, which means they are 0 on every path.
-The pathwise Rho is -T times the price on every path, because only the
-discount factor depends on the rate: -0.532 against a true 1.344.
+At h = 0, over 1,000,000 paths, the pathwise Delta and Vega have mean 0
+**and standard error 0**. That means they are zero on every single path. The
+pathwise Rho is -T times the price on every path (-0.532, against a true
+1.344), because only the discount factor depends on the rate.
 
-**Up-and-out call, barrier 120, 12 monthly fixings, 1,000,000 paths** (the
-parallel pricer, chunks of 10,000). Neither reference has a closed form:
+**Up-and-out call, barrier 120, 12 monthly fixings, 1,000,000 paths**
 
-- **Price reference.** The unsmoothed Monte Carlo price, 1.84857 (SE
-  0.00092), on 20,000,000 paths with seed 7. The price smoothing bias is
-  measured on those same paths, as the mean of the per-path difference
-  between the smoothed and the exact payoff, so its SE is that of the
-  difference alone.
-- **Greek reference.** Central-difference bump-and-reval of the unsmoothed
-  payoff on common random numbers (`bump_and_reval`), averaged over 128
-  independent seeds of 1,000,000 paths, with the SE taken across seeds:
-  Delta -0.00827 (SE 0.00131), Vega -14.890 (SE 0.100), Rho 1.989
-  (SE 0.118). Each revaluation sees the jump, so it is unbiased for the true
-  Greeks up to O(bump^2). The price of that is a variance of order 1/bump,
-  which is why it takes 128 million paths. The Greek z combines the
-  estimator's SE with the reference's; they are independent (different
-  seeds).
+Neither reference has a closed form here.
+- **Price reference.** The unsmoothed Monte Carlo price on 20,000,000 paths
+  (seed 7): 1.84857, SE 0.00092.
+  - The smoothing bias is measured on those same paths, as the mean of
+    (smoothed payoff - exact payoff), so its SE is that of the difference
+    alone.
+- **Greek reference.** Bump-and-reval of the unsmoothed payoff on common
+  random numbers, over 128 independent seeds of 1,000,000 paths: Delta
+  -0.00827 (SE 0.00131), Vega -14.890 (SE 0.100), Rho 1.989 (SE 0.118).
+  - Each repricing sees the jump, so the reference is unbiased up to
+    O(bump^2).
+  - Its variance is of order 1/bump, which is why it needs 128 million
+    paths.
+  - The z values combine both SEs.
 
 | h | price smoothing bias (z) | Delta | Delta bias (z) | Delta SE | Vega | Vega bias (z) | Vega SE | Rho | Rho bias (z) | Rho SE |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -518,80 +384,73 @@ parallel pricer, chunks of 10,000). Neither reference has a closed form:
 | 5 | -0.04398 (-167.5) | -0.0128 | -0.0045 (-2.7) | 0.0010 | -14.547 | +0.343 (+3.0) | 0.056 | 1.641 | -0.348 (-2.4) | 0.089 |
 | 10 | -0.16565 (-441.2) | -0.0153 | -0.0070 (-4.7) | 0.0007 | -13.140 | +1.751 (+16.5) | 0.035 | 1.556 | -0.433 (-3.3) | 0.063 |
 
-What the numbers say:
+**What to take from it**
+- **Unsmoothed pathwise Greeks are wrong, not just noisy.**
+  - On the barrier, Delta comes out +0.247 against a true -0.008, Vega +1.09
+    against -14.89, and Rho 22.9 against 2.0. Each is more than 150 SE off.
+  - The pathwise estimate only sees the call on surviving paths. It misses
+    the value lost at the knock-out, and that dominates.
+- **The bias really is h^2.**
+  - Digital Delta bias goes 4.9e-7, 2.0e-6, 7.9e-6, 4.9e-5, 2.0e-4, 7.6e-4
+    for h = 0.5 to 20. That is about 4x per doubling, and 6.2 from h = 2 to 5
+    against 6.25.
+  - Barrier price bias goes -0.00044, -0.00171, -0.00716, -0.0440, -0.1657
+    for h = 0.5 to 10: factors of 3.9, 4.2, 6.1 (against 6.25), and 3.8.
+- **SE really is 1/sqrt(h).** Barrier Delta SE is 0.0031 at h = 0.5 and
+  0.0007 at h = 10. That ratio is 4.4, against sqrt(20) = 4.47.
+- **The best h depends on your path count.**
+  - At 1,000,000 paths, digital Delta RMSE is lowest at h = 5 (0.00007).
+  - It is 0.00019 at h = 0.5, where noise wins, and 0.00076 at h = 20, where
+    bias wins.
+  - More paths push the best h down.
+- **What's left is pure smoothing bias.**
+  - Every smoothed digital row is within 1.35 SE of its exact call-spread
+    value.
+  - For the barrier, the Greek bias is too small to resolve up to h = 2 (|z|
+    at most 1.5).
+  - It shows clearly at h = 5 and 10: Vega +0.34 (z 3.0) and +1.75 (z 16.5),
+    and Delta -0.0070 (z -4.7) at h = 10.
+- **The barrier Delta is nearly zero.** The gain from a higher spot and the
+  loss from a likelier knock-out almost cancel (true Delta -0.008 +- 0.0013).
+  Vega is the clearer Greek to judge the bias by.
+- **The digital price bias is shared noise.** It sits around -0.0004 in every
+  row because every row uses the same 1,000,000 paths.
+- **Repeat run:** identical output.
 
-- **Unsmoothed pathwise Greeks are wrong, not noisy.** On the digital, Delta
-  and Vega are zero on every path. On the barrier, the pathwise Delta is
-  +0.247 against a true -0.008, Vega +1.09 against -14.89, and Rho 22.9
-  against 2.0, each more than 150 SE away. The pathwise estimate is the
-  call's Greek on the surviving paths. It misses the value lost at the
-  knock-out, which dominates.
-- **Smoothing bias scales as h^2.** The digital's exact Delta bias is 4.9e-7,
-  2.0e-6, 7.9e-6, 4.9e-5, 2.0e-4, and 7.6e-4 for h = 0.5 to 20, a factor of
-  about 4 per doubling (6.2 from h = 2 to 5, against 6.25). The barrier
-  price bias is -0.00044, -0.00171, -0.00716, -0.0440, and -0.1657 for
-  h = 0.5 to 10, factors of 3.9, 4.2, 6.1 (against 6.25), and 3.8.
-- **SE scales as 1/sqrt(h).** The barrier Delta SE is 0.0031 at h = 0.5 and
-  0.0007 at h = 10, a ratio of 4.4 against sqrt(20) = 4.47.
-- **The optimum width depends on the path count.** For the digital at
-  1,000,000 paths, Delta RMSE is lowest at h = 5 (0.00007: SE 0.00006, bias
-  -4.9e-5). It is 0.00019 at h = 0.5, where noise dominates, and 0.00076 at
-  h = 20, where bias dominates. More paths shrink the SE and move the optimum
-  to a smaller h.
-- **The estimator is unbiased for what it smooths.** Every smoothed digital
-  row sits within 1.35 SE of the call-spread closed form on all four
-  outputs, so the measured bias is the smoothing bias. For the barrier, the
-  Greek bias is below the reference's resolution up to h = 2 (|z| at most
-  1.5). It is resolved at h = 5 and 10: Vega +0.34 (z 3.0) and +1.75
-  (z 16.5), and Delta -0.0070 (z -4.7) at h = 10.
-- **The barrier Delta is close to zero.** Here the gain from a higher spot
-  and the loss from a likelier knock-out nearly cancel (true Delta
-  -0.008 +- 0.0013). Relative errors in Delta are large, and Vega is the
-  clearer Greek to read the bias from.
-- **The rows share their price noise.** The digital price bias of about
-  -0.0004 (z -0.9) in every row is the noise of those 1,000,000 paths, not
-  bias.
-- **Repeatability.** A second run gave identical output (fixed seeds,
-  parallel results merged in chunk and seed order).
+</details>
 
-### Netting-set CVA: AAD against bump-and-reval
+<details>
+<summary><b>Netting-set CVA</b> (65x at 620 sensitivities)</summary>
 
 ```bash
 cargo run --release --example cva_scaling
 ```
 
-`examples/cva_scaling.rs` computes the CVA of a book of netting sets, with
-every set's CVA, Delta, Rho, N bucket vegas, and K hazard-rate
-sensitivities, both ways:
+**The two methods**
+- **AAD** (`monte_carlo_cva`) records each path once and sweeps it once per
+  netting set.
+- **Bump-and-reval** (`bump_and_reval_cva`) reprices the whole book
+  2(N + K) + 5 times, every time on the same paths.
 
-- the adjoint pricer (`monte_carlo_cva`), which records each path once and
-  sweeps it once per netting set;
-- `bump_and_reval_cva`, which takes central differences of the tape-free
-  CVA, with every revaluation re-seeded onto the same paths. That costs
-  2(N + K) + 5 revaluations of the whole book.
+**Setup**
+- **Market:** S = 100, r = 5%, a flat 20% vol in N buckets over 5 years, 20
+  quarterly exposure dates.
+- **Book:** each netting set holds 10 European options: calls and puts,
+  strikes 80 to 120, maturities 1 to 5 years, long and short. Each set has
+  its own hazard rate between 1% and 3%, and recovery 40%. A bigger book only
+  adds sets.
+- **Runs:** 2,000 paths, seed 42, one warm-up, five timed rounds; median and
+  [min, max].
+- The last column is the worst gap, in AAD standard errors, over every set's
+  sensitivities. Each set's sensitivity to another set's hazard rate must be
+  exactly zero in both methods.
+- Measured 2026-10-26 on the M4.
 
-Setup:
-- **Market.** S = 100, r = 5%, a flat 20% vol split into N buckets over 5
-  years, and 20 quarterly exposure dates.
-- **Book.** Each netting set holds 10 European options (calls and puts,
-  strikes 80 to 120, maturities 1 to 5 years, long and short), with its own
-  hazard rate between 1% and 3% and recovery 40%. Set s is the same in every
-  book, so a larger book only adds sets.
-- **Protocol.** 2,000 paths, seed 42. Each point gets one discarded warm-up,
-  then five timed rounds of valuation, AAD, and bump-and-reval back to back.
-  The table gives the median and [min, max].
-
-The last column is the largest gap between an adjoint sensitivity and its
-bump-and-reval value, in adjoint standard errors, over every set. A set's
-sensitivity to another set's hazard rate must be exactly zero in both.
-Measured on 2026-10-26 on the same Apple M4.
-
-The path count is 2,000 rather than 10,000 because of the bump side. One
-valuation of the 10-set book takes 3.1 s at 10,000 paths. At that size,
-bump-and-reval at N = 50 would take about 6.5 minutes per run. Both methods
-are linear in the path count, so the ratios do not depend on it. A
-10,000-path run of the 10-set, 10-bucket book gave AAD / valuation 1.77,
-against 1.83 here.
+Why 2,000 paths rather than 10,000: one valuation of the 10-set book takes
+3.1 s at 10,000 paths, so bump-and-reval at N = 50 would take about 6.5
+minutes per run. Both methods are linear in the path count, so the ratios
+hold. A 10,000-path check of the 10-set, 10-bucket book gave AAD /
+valuation 1.77, against 1.83 here.
 
 **Vol buckets N, with K = 10 netting sets:**
 
@@ -613,54 +472,251 @@ against 1.83 here.
 | 10 | 22 x 10 | 45 | 613 | 1122 [1113, 1137] | 28012 [27760, 29318] | 0.040 | 1.83 | 45.7 | 18.8988 | 0.007 |
 | 20 | 32 x 20 | 65 | 1208 | 2427 [2408, 2449] | 79230 [78778, 80411] | 0.031 | 2.01 | 65.6 | 38.2908 | 0.009 |
 
-What the numbers say:
-
-- **Adding vol buckets barely moves AAD.**
-  - AAD went from 1141 to 1170 ms (1.80 to 1.94 valuations) as each set's
-    sensitivities grew from 13 to 62 (130 to 620 across the book).
-  - Bump-and-reval went from 17.3 s to 75.9 s, or 27.3 to 125.9 valuations,
-    against 2(N + K) + 5 = 27 to 125.
-  - At N = 50, AAD returns 620 sensitivities 65x faster than bump-and-reval
-    (AAD / bump 0.015).
-- **Adding netting sets costs both methods, but not equally.**
-  - One valuation is linear in K, about 60 ms per set (67 ms at K = 1,
-    1208 ms at K = 20).
-  - Bump-and-reval needs 2(N + K) + 5 of those valuations, so it grows
-    quadratically: 1.8 s at K = 1 and 79.2 s at K = 20.
-  - AAD sweeps once per set over a tape that also grows with K, so it has a
-    quadratic term too. Here that term is small: AAD went from 1.66 to 2.01
-    valuations between K = 1 and K = 20 (111 ms to 2427 ms). Before
-    measuring, I expected both methods to grow roughly as K^2; for AAD at
-    this size, that was wrong.
-  - Each backward sweep is two multiply-adds per tape node, while the
-    forward pass pays for two normal CDFs per trade per date. That
-    explanation is not separately measured.
-  - The AAD advantage still widens with K: AAD / bump is 0.062 at K = 1 and
-    0.031 at K = 20.
-- **Path simulation is a negligible share of the cost.** At N = 25 and 50
-  the grid has 40 and 60 steps instead of 20, yet a valuation took slightly
-  less time (620 and 603 ms against 640 ms). The cost is the Black-Scholes
-  future values. Those two rows also have a different total CVA, because a
-  finer grid draws different normals.
-- **Both methods compute the same sensitivities.** The largest gap is
-  0.009 adjoint standard errors, at every point, over every set's Delta,
-  Rho, vegas, and hazard-rate sensitivities. The cross-set hazard
-  sensitivities are exactly zero in both.
+**What to take from it**
+- **More vol buckets barely move AAD.**
+  - Going from 130 to 620 sensitivities took AAD from 1141 to 1170 ms (1.80
+    to 1.94 valuations).
+  - Bump-and-reval went from 17.3 s to 75.9 s, which is 27.3 to 125.9
+    valuations, against the 27 to 125 it should need.
+  - At N = 50 that is 65x.
+- **More netting sets cost both methods, just not equally.**
+  - A valuation is linear in K, about 60 ms per set.
+  - Bump-and-reval needs 2(N + K) + 5 of them, so it goes quadratic: 1.8 s
+    at K = 1, 79.2 s at K = 20.
+  - AAD also has a quadratic term, from one sweep per set over a tape that
+    grows with K. It is small here: 1.66 to 2.01 valuations from K = 1 to
+    20.
+  - I expected both to grow roughly as K^2 before measuring. For AAD at this
+    size, that was wrong.
+  - My explanation, not separately measured: a sweep is two multiply-adds
+    per node, while the forward pass pays for two normal CDFs per trade per
+    date.
+- **Path simulation is a rounding error.**
+  - At N = 25 and 50 the grid has 40 and 60 steps instead of 20, yet a
+    valuation got slightly faster (620 and 603 ms against 640). The cost is
+    the Black-Scholes future values.
+  - Those rows also show a different total CVA, because a finer grid draws
+    different normals.
+- **Same answers.** Every gap is within 0.009 SE, and the cross-set hazard
+  sensitivities are exactly zero in both methods.
 - **Run conditions.**
-  - The whole run took 33 minutes. Within a point, the five timed rounds
-    spread by at most 8.6% (AAD at N = 1, [1101, 1196] ms).
-  - For about 14 seconds during the N = 50 point, a second copy of the
-    benchmark started by mistake ran alongside it and was stopped. Its bump
-    rounds stayed within 2.8% of each other ([75247, 77324] ms).
-  - There is no second full run: the run takes 33 minutes.
+  - The whole run took 33 minutes, so it was not repeated.
+  - The five timed rounds of any point spread by at most 8.6% (AAD at N = 1,
+    [1101, 1196] ms).
+  - For about 14 s during N = 50, a second copy of the benchmark ran by
+    mistake before it was stopped. Those bump rounds stayed within 2.8%
+    ([75247, 77324] ms).
 
-### Python call latency
+</details>
+
+<details>
+<summary><b>Python call latency</b></summary>
 
 ```bash
 python benchmark.py
 ```
 
-This script reports two figures: per-call latency (a single `mc_pricer`
-invocation covering all simulated paths) and per-path latency (the
-per-call figure divided across those paths). Because the two figures
-answer different performance questions, both are reported.
+Prints per-call latency (one `mc_pricer` call over all paths) and per-path
+latency (that divided by the path count). No numbers from it are recorded in
+this README.
+
+</details>
+
+## Where it stops working
+
+- **Pathwise Greeks need a continuous payoff.**
+  - Calls, puts, and arithmetic Asians are fine.
+  - Digitals and barriers jump. A small bump never moves a path across the
+    jump, so the raw pathwise Greek is a confident, wrong number.
+  - Here they are only offered smoothed, with the bias measured above. The
+    likelihood-ratio method would be unbiased; this engine does not offer
+    it.
+- **CVA is deliberately simple.**
+  - It is unilateral, on European calls and puts only.
+  - Each counterparty has a flat hazard rate, independent of the spot, so
+    there is no wrong-way risk.
+  - There is no collateral, DVA, or FVA.
+- **One underlying, plain GBM.**
+  - Vol is piecewise constant in time. There is no Heston, no local vol, and
+    no multi-asset.
+  - Each step is the exact log-normal transition (log-Euler, which is exact
+    for GBM), so there is no discretization bias.
+- **Python is the narrow part.**
+  - The bindings cover only the European call, flat (`mc_pricer`) and
+    bucketed (`mc_pricer_buckets`).
+  - They run serially and return no standard errors.
+
+## Running the tests
+
+```bash
+cargo test --release
+```
+
+83 tests: one unit test and 82 integration tests across twelve files. Every
+Monte Carlo check uses a tolerance of five standard errors of the estimator
+under test, never a fixed number.
+
+The highlights:
+
+- **Closed forms.** Price and Greeks match Black-Scholes for calls, puts,
+  digitals, and a long-only CVA set.
+- **Same paths, same answers.** AAD matches bump-and-reval on common random
+  numbers for the Asian, the bucketed vol curve, the smoothed barrier, and
+  mixed CVA books.
+- **Bit-identical where it should be.** The parallel pricer on 1, 2, 4, and 8
+  threads, one bucket against the flat pricer, and the tape-free CVA against
+  the adjoint CVA.
+- **Failure modes are pinned down.** The exact digital's pathwise Delta is
+  zero on every path. Using a stale tape handle panics instead of reading
+  garbage.
+
+<details>
+<summary>Everything the suite checks</summary>
+
+- **Tape and operators.** Accumulation and reset; every operator and math
+  function against its analytical derivative.
+- **Normal CDF.** Checked against independently generated reference values.
+- **Handle validity.** A stale `Dual` or `Gradient` after a reset, a second
+  sweep, or on another thread is rejected.
+- **European call.** Matches closed-form Black-Scholes, with a cross-seed
+  consistency check.
+- **Put.**
+  - Matches Black-Scholes.
+  - Put-call parity holds on common paths, with exact standard errors for
+    the difference.
+- **Asian.** Every Greek matches bump-and-reval on common random numbers.
+- **Vol curve.**
+  - One bucket reproduces the flat pricer bit for bit.
+  - With equal bucket vols, the vegas sum to the flat Vega exactly on common
+    paths.
+  - On an unequal curve, the price and Greeks match Black-Scholes at the
+    integrated-variance vol, and each bucket vega matches bump-and-reval.
+  - An Asian whose fixings fall between bucket edges agrees with the flat
+    Asian.
+- **Bump-and-reval.** Matches the adjoint Greeks on the same seed, and its
+  price equals the adjoint price exactly.
+- **Parallel.**
+  - 1, 2, 4, and 8 threads give bit-identical results (20,500 paths, so the
+    last chunk is partial).
+  - Two chunk sizes give consistent estimates.
+  - The merged accumulator equals one sequential pass, including with an
+    empty side.
+- **Variance reduction.**
+  - All four methods agree.
+  - With one fixing the controlled estimator is Black-Scholes, with an SE
+    below 1e-10.
+- **Smoothing.**
+  - The digital closed form equals minus the strike derivative of the call.
+  - The smoothed digital matches its call spread at three strikes and two
+    widths.
+  - The bias falls 4x when h halves.
+  - The exact digital's pathwise Delta and Vega are zero on every path.
+  - An unreachable barrier is the European call bit for bit.
+  - The smoothed barrier's Greeks match bump-and-reval of the same payoff.
+- **CVA.**
+  - Netting never raises CVA or exposure, and a fully offset set has CVA and
+    every sensitivity exactly zero.
+  - A long-only set matches its closed form for CVA, every Greek, the
+    hazard-rate sensitivity, and the exposure profile.
+  - Equal bucket vegas sum to the flat Vega.
+  - Cross-set hazard sensitivities are exactly zero, and the total equals the
+    sum of the sets.
+  - The tape-free CVA equals the adjoint CVA bit for bit.
+  - Mixed books match bump-and-reval.
+
+</details>
+
+CI (`.github/workflows/ci.yml`) runs `cargo test --release` and a maturin
+build-install-import check on every push and pull request, on
+`ubuntu-latest`. There is no deploy step.
+
+## Project layout
+
+| Path | What's in it |
+|---|---|
+| `src/tape.rs` | The tape: a thread-local log of operations and the backward sweep |
+| `src/dual.rs` | `Dual`, a 16-byte handle to a tape node, and `Gradient` |
+| `src/ops.rs` | Operators and math functions, each with its derivative |
+| `src/special.rs` | Normal CDF and density |
+| `src/payoff.rs` | The `Payoff` and `Real` traits and every payoff |
+| `src/pricer.rs` | The Monte Carlo pricer, vol buckets, parallel chunks, Black-Scholes closed forms |
+| `src/variance.rs` | Antithetic sampling and the geometric control variate |
+| `src/bump.rs` | Bump-and-reval, the slow way and the oracle |
+| `src/xva.rs` | Netting-set CVA |
+| `src/python.rs` | The PyO3 bindings |
+| `examples/` | The five benchmarks above |
+| `tests/` | The test suite |
+| `main.py`, `benchmark.py` | Python smoke test and latency script |
+
+<details>
+<summary><b>Engine internals</b>, for the curious</summary>
+
+- **Tape.**
+  - Each node stores up to two parent indices and their local partial
+    derivatives.
+  - It lives in a `bumpalo` arena, one per thread.
+  - A reset clears the node list but keeps its capacity.
+- **Dual numbers.**
+  - A `Dual` is `{ value, index, generation }`. It holds no derivative data
+    itself.
+  - Every recording gets a fresh generation id, so using a handle from an
+    old recording panics with a "stale" message instead of reading whatever
+    node now sits at that index.
+  - The generation is a `u32`, so it wraps after 2^32 resets.
+- **One payoff code path.**
+  - Payoffs are written once against a small `Real` trait implemented for
+    `Dual` and for `f64`.
+  - On `Dual` every step is recorded; on `f64` nothing is.
+  - That gives a tape-free pricer that sees exactly the same paths, which is
+    what makes bump-and-reval a fair oracle.
+- **Normal CDF.**
+  - The common Hart/West rational approximation is off by about 8.7e-9 near
+    |x| = 8, measured against 60-digit references.
+  - This one splits at |x| = 1.5. Below that it uses an all-positive `erf`
+    series; above it, a Mills-ratio continued fraction run to convergence.
+  - Worst case is 2.6e-15 against the same references.
+- **Vol curve grid.**
+  - Fixing dates and bucket edges are merged in exact integer units of
+    T / (nN).
+  - So every step sits inside one bucket and stays an exact log-normal
+    transition.
+- **Parallel merge.**
+  - Each chunk keeps Welford accumulators.
+  - They are combined with the Chan, Golub, and LeVeque pairwise formula, in
+    chunk order.
+- **Control variate.**
+  - The geometric Asian's closed form is written in `Dual` arithmetic and
+    recorded once per run, so its Greeks are exact.
+  - The coefficient is fixed at 1, which keeps every Greek unbiased; an
+    estimated one would add O(1/n) bias.
+- **CVA.**
+  - Each trade's value at an exposure date is Black-Scholes on the variance
+    left on the curve.
+  - Spot, rate, every bucket vol, and every hazard rate are tape inputs.
+  - Each path is recorded once and swept once per netting set.
+
+</details>
+
+## Built using
+
+- [Rust](https://www.rust-lang.org/), with [rand](https://crates.io/crates/rand)
+  and [rand_distr](https://crates.io/crates/rand_distr) for random numbers
+- [bumpalo](https://crates.io/crates/bumpalo) for the tape arena
+- [rayon](https://crates.io/crates/rayon) for parallel paths
+- [PyO3](https://pyo3.rs/) and [maturin](https://www.maturin.rs/) for the
+  Python bindings
+
+## Author
+
+- [@savsuth](https://github.com/savsuth)
+
+## Acknowledgements
+
+The methods this leans on:
+
+- **Hull**, *Options, Futures, and Other Derivatives*, for the textbook check
+  values.
+- **Kemna and Vorst**, for the geometric Asian control variate.
+- **Chan, Golub, and LeVeque**, for merging variance accumulators.
+- **Cody**, for the split-exponent trick in the normal density.
+- **Lentz**, for the continued-fraction evaluation.
